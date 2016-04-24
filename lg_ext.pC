@@ -1,0 +1,1363 @@
+#include <iostream>
+#include <stdio.h>
+#include <strings.h>
+#include <string.h>
+#include <string>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <fstream>
+#include <sqlca.h>                                                             // NOTE USE OF SQLCA
+
+#include "lg_ext.h"
+#include "lg_common.cpp"
+
+//----------------------------------------------------------------------------------------
+// DECLARE SECTION
+// The following are PRO*C variable declarations
+// Not declared on single line, which allows for a better description of each var.
+//----------------------------------------------------------------------------------------
+EXEC SQL BEGIN DECLARE SECTION;
+	//------- Connect
+	char 		*username="/";                                         // Connect as ops$oracle in sysdba mode
+	char        	hv_WorkingSCN[MAX_SCN_LENGTH];                         // Our active SCN that we're using
+	char 		hv_KTUXE_SCN[MAX_SCN_LENGTH];                          // The system wide SCN
+	char 		hv_old_KTUXE_SCN[MAX_SCN_LENGTH];                      // The previous system wide SCN
+	char    	hv_CURRENT_SESSION_SCN[MAX_SCN_LENGTH];                // From v$transaction - current SCN
+	char 		hv_TEMP_SCN[MAX_SCN_LENGTH];                           // temporary buffer
+	char 		hv_MinerSTARTSCN[MAX_SCN_LENGTH];                      // The start SCN we'll use for our logminer calls
+
+        unsigned int    hv_object_counter=0;                                   // Make sure the user has objects to replicate
+
+        //-------------------------------------------------
+        // indicator variables. Used to indicate if val is 
+        // null
+        //-------------------------------------------------
+        short		scn_ind[ARRAY_SIZE], cscn_ind[ARRAY_SIZE], sql_ind[ARRAY_SIZE], time_ind[ARRAY_SIZE], csf_ind[ARRAY_SIZE];
+        short           hv_boolean=0;                                          // Need bool when using db for SCN compare
+        //------------------------------------------------- 
+        long            hv_UTCoffset=0;                                        // Offset from UTC as calculated by db 
+        unsigned long  	hv_maxLastDDLTime=0;                           
+        //------------------------------------------------
+        // Redo log maintenance
+        //------------------------------------------------
+	char	 	hv_logFirstChangeSCN[MAX_SCN_LENGTH];                  // The start SCN from v$log
+	unsigned int 	hv_logGroupNumber=0;                                   // the redo group from v$log
+        varchar		hv_logMember[128];                                     // the file name from v$logfile
+        //------------------------------------------------
+        //  Fetching into arrays
+        //------------------------------------------------
+	char            hv_scn[ARRAY_SIZE][MAX_SCN_LENGTH];                    // System change numbers
+	char            hv_cscn[ARRAY_SIZE][MAX_SCN_LENGTH];                   // Commit System change number
+	varchar         hv_sysdate[ARRAY_SIZE][24];                            // The sysdate 
+	varchar		hv_sql_redo[ARRAY_SIZE][8192];                         // The actual redo statement
+        int             hv_csf[ARRAY_SIZE];                                    // Is the statement in one row ?
+        varchar         hv_TableName[32];                                      // the limit for tablename and owner is 30 chars
+        varchar         hv_schemaOwner[32];                                    // but set to 32 so it ends on double word boundary
+EXEC SQL END DECLARE SECTION;
+//----------------------------------------------------------------------------------------------------------------------
+// END DECLARE
+//----------------------------------------------------------------------------------------------------------------------
+
+Environment   Env;                                                             // Environment class - generic functions like logit
+lg_Statistics lg_stat;                                                         // structure - Used to record stats to a file
+std::string sqlStr;                                                            // A nasty global variable
+
+int main(int argc, char* argv[])
+{
+  //---------------------------------------------------------
+  // Wipe out the fields declared in the Pro*C section above
+  //---------------------------------------------------------
+  memset( hv_WorkingSCN,          '\0', MAX_SCN_LENGTH); 
+  memset( hv_KTUXE_SCN,           '\0', MAX_SCN_LENGTH);
+  memset( hv_old_KTUXE_SCN,       '\0', MAX_SCN_LENGTH);
+  memset( hv_CURRENT_SESSION_SCN, '\0', MAX_SCN_LENGTH);
+  memset( hv_TEMP_SCN,            '\0', MAX_SCN_LENGTH);
+  memset( hv_MinerSTARTSCN,       '\0', MAX_SCN_LENGTH);
+  memset( hv_logFirstChangeSCN,   '\0', MAX_SCN_LENGTH);
+ 
+  int i1=0;
+  for(i1=0; i1< ARRAY_SIZE; i1++)
+  {
+    memset( hv_scn[i1],  '\0', MAX_SCN_LENGTH); 
+    memset( hv_cscn[i1], '\0', MAX_SCN_LENGTH); 
+  }
+
+  //std::cout << "DEBUG: Begin v1";
+
+  //---------------------------------------------------------
+  // Initialize some variables with the general environment
+  //---------------------------------------------------------
+  std::string lg_home, oracleBase;
+  if( Env.getEnv(lg_home, oracleBase) != TRUE)
+  {
+    std::cerr << Env.error() << std::endl;
+    exit(1);
+  }
+  //------------------------------------------------------------------
+  // Using those settings from above, set other environment variables 
+  //------------------------------------------------------------------
+  if( Env.setEnv("lg_ext", lg_home, oracleBase) != TRUE)
+  {
+    std::cerr << "Could not set the environment" << std::endl;
+    exit(1);
+  }
+
+  //---------------------------------------------------------------------
+  // First thing we want from the init file is the name of the logfile
+  //---------------------------------------------------------------------
+  std::string logFileName;
+  if( Env.readConfig("logfile", logFileName) != TRUE)
+  {
+    std::cerr << "Terminating: logfile is not specified in the configuration file." << std::endl;
+    exit(1);
+  }
+  Env.openLog(logFileName);
+
+  //---------------------------------------------------------------------
+  // Which schema owner will we be replicating (keeping it flexible)
+  //---------------------------------------------------------------------
+  std::string schemaOwner;
+  if( Env.readConfig("schema_owner", schemaOwner) != TRUE)
+  {
+     Env.logIt(INFO, "(ERROR)\nParameter 'schemaOwner' is not specified in the configuration file.  Aborting.\n");
+     exit(1);
+  }
+  strcpy((char*)hv_schemaOwner.arr, schemaOwner.c_str());
+  hv_schemaOwner.len =  schemaOwner.length();
+
+  //---------------------------------------------------------
+  // Get the lockfile from the conf file
+  //---------------------------------------------------------
+  std::string lockFile;                                                        // standard issue lockfile
+  if( Env.readConfig("lockfile", lockFile) != TRUE)
+  {
+     Env.logIt(INFO, "(ERROR)\nLock file is not specified in the configuration file. Aborting.\n");
+     exit(1);
+  }
+  
+  //---------------------------------------------------------
+  // Get the STAT file from the conf file
+  //---------------------------------------------------------
+  std::string statFile;
+  if( Env.readConfig("statfile", statFile) != TRUE)
+  {
+     Env.logIt(INFO, "(ERROR)\n\textractor SCN file is not specified in the configuration file.\n");
+     exit(1);
+  }
+
+  //-----------------------------------------------------------
+  // Get  the queue file name (aka datafile) from the conf file 
+  //-----------------------------------------------------------
+  std::string queueDir;
+  if( Env.readConfig("queue_directory", queueDir)  != TRUE)
+  {
+     Env.logIt(INFO, "(ERROR)\n\t\tData directory not specified in the configuration file\n");
+     exit(1);
+  }
+
+  //---------------------------------------------------------
+  char timeBuffer[TIME_BUF_LN];
+  //---------------------------------------------------------
+  // The following will create the stat file, and exit.
+  // Now that we have what we want, lets  see if any command
+  // line args have been specified to init the stat file
+  // NOTE: We do not call the initialize routine here
+  //       since we are specifying the SCN as part of the 
+  //       command line
+  //---------------------------------------------------------
+
+  if(argc != 1)
+  {
+    if( argc != 3)
+    {
+       std::cout << "Invalid number of arguments to lg_ext\n";
+       exit(1);
+    }
+    if( (strcmp(argv[1],"-i")==0) || (strcmp(argv[1],"-r")==0) )                // add -r for reset of scn
+    {
+       Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+       Env.logIt(INFO, "##### Extractor Initialization #####\n");
+
+       if(strlen(argv[2]) < 4)                                                    // After DB create the SCN is ~ 40,000
+       {
+         Env.logIt(INFO, "\t\tInvalid SCN argument to lg_ext\n");
+         exit(1);
+       }
+       if (strcmp(argv[1],"-i")==0)
+       {
+         if ( Env.initStatFile( statFile.c_str()) != TRUE)
+         {
+            Env.logIt(INFO, "\t\tCould not initialize the stat file");
+         } 
+       }
+
+       if (Env.mapIt(statFile.c_str()) != TRUE)
+       {
+          Env.logIt(INFO, Env.error() );
+          exit(1);
+       }
+       else
+       {
+          Env.logIt(INFO, "\t\tStat file mapped\n");
+       }
+       //--------------------------------------------------------------------------------
+       // MLV:  8.4.2008 - We need a -r flag that will only reset the SCN 
+       //       and not the queue number. When we run dbpatchy in a replicated
+       //       environment, we only want to bump up the SCN to bypass items we don't
+       //       want to replicate. However, this was causing the queue number
+       //       to also be changed. 
+       //--------------------------------------------------------------------------------
+       if (strcmp(argv[1],"-r")==0)
+       { 
+           if(Env.readStatsFromFile(lg_stat) != TRUE)                                   // Let's read the last saved stats
+           {
+              Env.logIt(INFO, "\t\tERROR: Could not retrieve previous SCN. Aborting\n");
+              exit(1);
+           }
+           else
+           {
+              Env.logIt(INFO, "\t\tResetting SCN only\n");
+           }
+       }
+       else
+       {
+          Env.logIt(INFO, "\t\tInitializing queue and resetting SCN \n");
+          lg_stat.queueNumber=1;
+       }
+       strcpy(lg_stat.SCN, argv[2]);
+       Env.logIt(INFO, "\t\tInitializing statistics file ===> ");
+       Env.logIt(INFO_CR, (char*)statFile.c_str());
+       Env.logIt(INFO, "\t\tSetting SCN to : ");
+       Env.logIt(INFO_CR, lg_stat.SCN);
+
+       if( Env.writeStatsToFile(lg_stat) != TRUE)
+       {
+         Env.logIt(INFO, "Could not write to stats file.\n");
+         exit(1);
+       }
+       Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+       Env.logIt(INFO, "Initialized stat file :");
+       Env.logIt(INFO, (char*) statFile.c_str());
+       Env.logIt(INFO, "\n\t\t----------------------------------------------------------\n");
+       exit(0);
+    }
+    else
+    {
+      std::cout << "Invalid initialize call to lg_ext\n"; 
+    }
+  } 
+
+  //-----------------------------------------------------
+  // WHat's the minimum amount of seconds we should sleep
+  // Get this from the config file, which is set during
+  // install, and can be changed via lg_cntrl
+  //-----------------------------------------------------
+  std::string configFileBuffer; 
+  int minSleepTime=0; 
+
+  if( Env.readConfig("sleep", configFileBuffer)  != TRUE)
+  {
+     minSleepTime=2;
+     Env.logIt(INFO, "(WARNING)\n\tSleep time is not specified in config file: Defaulting to 2\n");
+  }
+  else
+  {
+     minSleepTime=atoi(configFileBuffer.c_str());
+     if((minSleepTime < 0) || (minSleepTime > 6))
+     {
+        Env.logIt(INFO, "(WARNING)\n\tInvalid sleep time specified in config file: Defaulting to 2\n");
+        minSleepTime=2;
+     }
+  }
+  //-----------------------------------------------------
+  // WHat's the max number of queue logs we support 
+  //-----------------------------------------------------
+  int numberOfQueues=3; 
+
+  if( Env.readConfig("queue_groups", configFileBuffer)  != TRUE)
+  {
+     numberOfQueues=3;
+     Env.logIt(INFO, "(WARNING)\n\tThe number of queue files is not specified in config file: Defaulting to 3\n");
+  }
+  else
+  {
+      numberOfQueues=atoi(configFileBuffer.c_str());
+      if((numberOfQueues < 1) || (numberOfQueues > 12))
+      {
+         Env.logIt(INFO, "(WARNING)\n\tInvalid number of queue files specified in config file: Defaulting to 3\n");
+         numberOfQueues=3;
+      }
+  }
+
+  //-----------------------------------------------------
+  // How big is our batch retrieval of records. 
+  // Get this from the config file, which is set during
+  // install, and can be changed via lg_cntrl
+  //-----------------------------------------------------
+  int batchRecords=0; 
+  if( Env.readConfig("batch", configFileBuffer)  != TRUE)
+  {
+      batchRecords=300;
+      Env.logIt(INFO, "(WARNING)\n\tBatch records not specified in config file: Defaulting to 300\n");
+  }
+  else
+  {
+      batchRecords=atoi(configFileBuffer.c_str());
+      if((batchRecords < 0) || (batchRecords > 1000))
+      {
+         Env.logIt (INFO, "(WARNING)\n\tInvalid batch records specified in config file. Defaulting to 300\n");
+         batchRecords=300;
+      }
+  }
+
+  //---------------------------------------------------------------------------
+  // Now, let's check the lock
+  //---------------------------------------------------------------------------
+
+  Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+  Env.logIt(INFO, "Checking lock ");
+  if( Env.checkLock(lockFile.c_str()) == TRUE)
+  {
+     Env.logIt(INFO, "(ERROR)\nTerminating: lockfile\n");
+     exit(1);
+  }
+  Env.logIt(INFO, "(ok)\n");
+
+  //---------------------------------------------------------------------------
+  // Check to make sure the MAP file used for tracking SCN's is available
+  //---------------------------------------------------------------------------
+  Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+  Env.logIt(INFO_PAD, "Checking SCN tracking file ");
+ 
+  struct stat   statbuf;                                                       // File information
+  int fd = ::open(statFile.c_str(),  O_RDONLY );                               // does the file even exist ?
+  if( fstat(fd,&statbuf) < 0 )
+  {
+   Env.logIt(INFO, "(ERROR) Could not stat\n"); 
+   exit(1);
+  }
+
+  if (Env.mapIt(statFile.c_str()) != TRUE)                                     // and if it exists, can we even map it ?
+  {
+    Env.logIt(INFO, Env.error() );
+    exit(1);
+  }
+  Env.logIt(INFO, "(ok)\n");
+
+  //-------------------------------------------------------
+  // Report on contents saved in lg_stat
+  //-------------------------------------------------------
+  Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+  Env.logIt(INFO_PAD, "Retrieving saved scn ");
+
+  if(Env.readStatsFromFile(lg_stat) != TRUE)                                   // Let's read the last saved stats
+  {
+    Env.logIt(INFO, "ERROR \n\tCould not retrieve previous SCN. Aborting\n");
+    exit(1);
+  }
+  Env.logIt(INFO, "(ok)\n");
+
+  //---------------------------------------------------------
+  // Check to see if we can access the queue 
+  //---------------------------------------------------------
+  char tempString[MAX_TMP_LN];
+  memset(tempString,'\0', MAX_TMP_LN);                                      // Reside on a word boundary 4, 8, 12
+  sprintf(tempString,"%05d", lg_stat.queueNumber);
+  std::string queueFile=std::string(queueDir) + "/queue" + tempString; 
+  glb_queuefile.open(queueFile.c_str(), std::ios::out | std::ios::app);
+  if(! glb_queuefile)
+  {
+      Env.logIt(INFO, "\t\tERROR - Could not open for writing: ");
+      Env.logIt(INFO_CR,  (char*)queueFile.c_str());
+      exit(1);
+  }
+  Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+  Env.logIt(INFO,     "queue member : ");
+  Env.logIt(INFO_CR,  (char*)queueFile.c_str());
+
+
+  //---------------------------------------------------------------------------
+  // INITIALIZE SECTION 
+  // The following will initialize the redo logs status. 
+  // This is used for attaching  and detaching redo logs to logminer
+  //---------------------------------------------------------------------------
+  RedoStruct RedoLog1, RedoLog2;
+ 
+  int i=0;
+  for(i=0; i< MAX_REDO_ENTRIES; i++)
+  {
+ 	RedoLog1.status[i] = -1;
+ 	RedoLog2.status[i] = -1;
+  }
+
+  //---------------------------------------------------------------------------
+  // SQL CONNECT SECTION
+  //---------------------------------------------------------------------------
+  Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+  Env.logIt(INFO_PAD, "Trying to connect to the RDBMS ");
+  sql_proc(TRUE, "Trying to connect");                                         // Call to the function that actually connects
+
+  //---------------------------------------------------------------------------------
+  // CHECK DICTIONARY FILE
+  // The first call is to get the UTC offset from oracle, and the convert to seconds
+  //---------------------------------------------------------------------------------
+  EXEC SQL WHENEVER NOT FOUND DO sql_proc(FALSE, "ORACLE ERROR (not found)"); 
+  EXEC SQL WHENEVER SQLERROR  DO sql_proc(FALSE, "ORACLE error(UTC offset)");
+
+  EXEC SQL SELECT  count(*) into :hv_object_counter 
+           FROM    sys.dba_objects
+           WHERE   owner = :hv_schemaOwner
+           AND     object_type = 'TABLE';
+
+  if(hv_object_counter == 0 )
+  {
+    Env.logIt(TIME,   Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO,   "User specified in configuration file owns no tables ");
+    exit(1);
+  }
+
+  EXEC SQL SELECT   (-1) * ( to_number(substr(sessiontimezone,1,3) * 3600) + 
+                             to_number(substr(sessiontimezone,5  ) * 60) ) into :hv_UTCoffset
+           from dual ;
+
+  //------------------------------------------------------------------------------------
+  // This call queries the catalog for the object creation time and adds (or substracts)
+  // the offset 
+  //------------------------------------------------------------------------------------
+  Env.logIt(INFO_PAD, "\t\tAdjusting for UTC (in secs) ");
+  Env.logIt(INFO_CR,  (unsigned long)hv_UTCoffset );
+
+  EXEC SQL SELECT max( ((created - to_date('01-JAN-1970','DD-MON-YYYY')) * 86400) ) + :hv_UTCoffset into :hv_maxLastDDLTime
+           FROM   sys.dba_objects
+           WHERE  owner = :hv_schemaOwner
+           AND    object_type = 'TABLE';
+ 
+  Env.logIt(INFO_PAD, "\t\tstat file (in seconds) :");
+  Env.logIt(INFO_CR,  (unsigned long)statbuf.st_mtime);
+  Env.logIt(INFO_PAD, "\t\tMax DDL time ");
+  Env.logIt(INFO_CR,  (unsigned long)hv_maxLastDDLTime); 
+
+  //------------------------------------------------------------------------------------
+  // Now we can compare the stat file time vs. the object creation time
+  //------------------------------------------------------------------------------------
+  if( (unsigned long)statbuf.st_mtime < hv_maxLastDDLTime)
+  {
+    Env.logIt(INFO, "\t\tSome objects have been created since the last time logminer ran\n");
+    Env.logIt(INFO, "\t\tyou must reset the SCN via the lg_cntrl reset command to start logminer\n");
+  } 
+
+  //---------------------------------------------------------------------------
+  // Get the last SCN number, since the last time we ran this program 
+  //---------------------------------------------------------------------------
+  strcpy((char*)hv_WorkingSCN, lg_stat.SCN); 
+
+  Env.logIt(INFO, "\t\tLast recorded SCN was : ");
+  Env.logIt(INFO_CR, lg_stat.SCN);
+  Env.logIt(INFO, "\t\tLast recorded queue group : ");
+  Env.logIt(INFO_CR, lg_stat.queueNumber);
+  
+  strcpy(hv_old_KTUXE_SCN, hv_WorkingSCN);                     // This is the last time we had any activity
+  //---------------------------------------------------------------------------
+  // CURSOR SECTION
+  //---------------------------------------------------------------------------
+  EXEC SQL DECLARE C1 CURSOR FOR
+           SELECT a.first_change#, a.group#, b.member 
+           FROM   SYS.V_$LOG a, SYS.V_$LOGFILE b          
+           WHERE  a.first_change# >=
+           (
+               SELECT nvl(max(first_change#),0)
+               FROM   sys.v_$log
+               WHERE  first_change# <= (:hv_WorkingSCN  - 100)
+           )
+           AND   b.group# = a.group#;
+
+  //-------------------------------------------------------------------
+  // Give me all the redo log entries in v$log that I'm going to need
+  // In the drop redo log session, any log that dosen't match the output
+  // of this query will be dropped from the list
+  // This is needed for the following reason:
+  // Before we changed this query, we were looking at logs that matched
+  // our list. However, if there's rapid data entry, it's possible
+  // that a log can wrap and be different that the list we are maintaining
+  //-------------------------------------------------------------------
+  EXEC SQL DECLARE C2 CURSOR FOR
+           SELECT a.first_change#, a.group#
+           FROM   SYS.V_$LOG a
+           WHERE  a.first_change# >= 
+           (
+               SELECT nvl(max(first_change#),0)
+               FROM   sys.v_$log
+               WHERE  first_change# <= (:hv_WorkingSCN - 100)
+           );
+
+  //--------------------------------------------------------------------------
+  // THIS IS THE BIG KAHUNA
+  //--------------------------------------------------------------------------
+  EXEC SQL DECLARE CONTENT_CURSOR CURSOR FOR
+         SELECT /*+ RULE */ a.scn, a.cscn, to_char(sysdate,'DD-MON-YYYY HH24:MI:SS'), 
+                a.csf, a.sql_redo
+         FROM   v$logmnr_contents a
+         WHERE  a.operation in  ('INSERT', 'UPDATE','DELETE', 'COMMIT')
+         AND    (a.username != 'SYS' OR a.username is NULL)
+         AND    ( a.seg_owner = :hv_schemaOwner or a.seg_owner is null)
+         AND    a.serial#  not in (select serial#    from post_stats)
+         AND    a.seg_name not in 
+                (
+                   select table_name from rep_table_ignore ignore
+                   where  ignore.table_name = a.seg_name
+                   and    ignore.operation  = a.operation
+                ) 
+         AND    cscn >   :hv_WorkingSCN
+         AND    cscn <=  :hv_KTUXE_SCN
+         AND    a.cscn in
+                (
+                  SELECT distinct b.cscn
+                  FROM   v$logmnr_contents b
+                  WHERE  b.operation in ('INSERT', 'UPDATE','DELETE')
+                  AND    (b.username != 'SYS' OR b.username is NULL)
+                  AND    ( b.seg_owner = :hv_schemaOwner or b.seg_owner is null)
+                  AND    b.serial#  not in (select serial#    from post_stats)
+                  AND    b.seg_name not in 
+                         (
+                            select table_name from rep_table_ignore ignore
+                            where  ignore.table_name = b.seg_name
+                            and    ignore.operation  = b.operation
+                         ) 
+                  AND    cscn >   :hv_WorkingSCN
+                  AND    cscn <=  :hv_KTUXE_SCN
+                 )
+         AND    a.cscn <= :hv_CURRENT_SESSION_SCN
+         ORDER BY a.cscn, a.scn, a.rs_id, a.csf desc;
+
+
+  //--------------------------------------------------------------------------
+  // The only purpose of this query is to warn the user (via the log) that 
+  // some tables will not resolve cleanly due to the fact that they don't
+  // have a unique index
+  //--------------------------------------------------------------------------
+
+  EXEC SQL DECLARE TABLE_CURSOR CURSOR FOR
+        SELECT table_name from dba_tables 
+        WHERE  OWNER = :hv_schemaOwner 
+	MINUS
+	SELECT table_name from dba_indexes
+	WHERE  uniqueness = 'UNIQUE'
+	AND    OWNER = :hv_schemaOwner; 
+
+
+  //--------------------------------------------------------------------------
+  // Now let's report on which tables don't have a unique index
+  //--------------------------------------------------------------------------
+  EXEC SQL WHENEVER NOT FOUND DO break; 
+  EXEC SQL OPEN TABLE_CURSOR;
+  Env.logIt(INFO, "\t\t-----------------------------------------------------------------------------------------------\n"); 
+  Env.logIt(INFO, "\t\t Tables that have no unique/primary indexes and may have replication problems for update/delete.\n"); 
+  Env.logIt(INFO, "\t\t-----------------------------------------------------------------------------------------------\n"); 
+  int looper=TRUE;
+  while(looper==TRUE)
+  {
+     memset(hv_TableName.arr,'\0', sizeof(hv_TableName.arr));
+     EXEC SQL FETCH TABLE_CURSOR INTO :hv_TableName;
+     Env.logIt(INFO,    "\t\t"); 
+     Env.logIt(INFO,    (char*)hv_TableName.arr);
+     Env.logIt(INFO_CR, "\thas no unique index"); 
+ 
+  }
+  if (sqlca.sqlerrd[2] == 0) Env.logIt(INFO, "\t\tAll tables will replicated cleanly.\n");
+  EXEC SQL CLOSE TABLE_CURSOR;
+  Env.logIt(INFO,  "\t\t-----------------------------------------------------------------------------------------------\n"); 
+  
+
+  //--------------------------------------------------------------------------------------
+  // How do we handle signals ?
+  //--------------------------------------------------------------------------------------
+  signal(SIGUSR1, &Cleanup);
+  sigset(SIGUSR1, &Cleanup);
+  signal(SIGUSR2, &Wakeup);
+  sigset(SIGUSR2, &Wakeup);
+  sigignore(SIGHUP);
+  sigignore(SIGINT);
+  sigignore(SIGALRM);
+
+  //---------------------------------------------------------------------------
+  // The following variables are used in the following while loop. 
+  //---------------------------------------------------------------------------
+  int  sleepCounter=0;                                                          // how many time we've slept without doing work
+  int  sleepTime = minSleepTime;                                                // How many seconds to sleep. Initialized to def.
+  int  logMinerStarted=FALSE;                                                   // flag used before calls to logminer_contents
+  int  StartupFlag=FALSE; 
+  int  FetchedFlag=FALSE;                                                       // Did we fetch any rows ? 
+  int  Rc=0;                                                                    // Value of current queue number
+  long totalRowsFetched=0;                                                      // Total number of rows fetched
+  char TimeBuffer[TIME_BUF_LN];                                                 // used when displaying time         
+  char scnBuffer[MAX_SCN_LENGTH];                                               // used for recording the Max SCN value
+  char *MaxCSCN;
+  //-------------------------------------- 
+  int	redo1Counter=0, redo2Counter=0, redoLooper=TRUE, redoGroupFlag=FALSE;
+  unsigned int   LastFetchedGroupNumber=0;
+  //---------------------------------------------------------------------------
+  // END VARIABLE SECTION
+  // Tell oracle how to behave when we encounter an error or a 'not found'
+  //---------------------------------------------------------------------------
+  EXEC SQL WHENEVER SQLERROR DO sql_proc(FALSE, "ORACLE error (main)");
+  EXEC SQL WHENEVER NOT FOUND DO break; 
+
+  Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+  Env.logIt(INFO_CR, ">>>>> Begin lg_ext.exe");
+
+  while(looper==TRUE)
+  {
+        sleep(sleepTime);
+
+        //--------------------------------------------------------------------------------------------------
+        // TRANSACTION SECTION 
+        // Get the current transaction (if any) and the current system wide SCN.
+        // Take the lesser of the two.
+        // NOTE: Sometimes, v$transaction returns 0 (methinks its a bug within oracle). Make sure we deal with it 
+        //--------------------------------------------------------------------------------------------------
+        EXEC SQL select to_char(max(ktuxescnw * power(2, 32) + ktuxescnb)) into :hv_KTUXE_SCN   from sys.x$ktuxe;
+
+        EXEC SQL
+             select decode(nvl(to_char(min(b.start_scnb)),'0'), '0', '999999999999999', to_char(min(b.start_scnb)) )
+             into   :hv_CURRENT_SESSION_SCN
+             from   v$session a, v$transaction b
+             where  a.taddr = b.addr
+             and    a.username != 'SYS';
+
+
+        if( strncmp(hv_CURRENT_SESSION_SCN, "999999999999999", 15) != 0 )       // If there's a session going on.. then
+        {
+           EXEC SQL SELECT sign(:hv_CURRENT_SESSION_SCN - :hv_KTUXE_SCN) into :hv_boolean from dual; 
+           if(hv_boolean == 1) 
+           {
+              Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+	      Env.logIt(INFO, "Session SCN is greater than ktuxe\n\t\tSESSION ==> ");
+	      Env.logIt(INFO, hv_CURRENT_SESSION_SCN );
+	      Env.logIt(INFO, "\n\t\tKTUXE ==> ");
+	      Env.logIt(INFO_CR, hv_KTUXE_SCN );
+              strcpy(hv_CURRENT_SESSION_SCN,hv_KTUXE_SCN);
+           }
+        }
+
+        EXEC SQL SELECT sign(:hv_KTUXE_SCN - :hv_old_KTUXE_SCN) into :hv_boolean from dual; 
+        if(hv_boolean == 1 )                                             // Did anything on the system change
+        {
+  		EXEC SQL OPEN C1;
+                LastFetchedGroupNumber = 0;
+                while(redoLooper == TRUE)
+                {
+			memset(hv_logMember.arr, '\0', sizeof(hv_logMember.arr));
+			EXEC SQL FETCH C1 INTO :hv_logFirstChangeSCN, :hv_logGroupNumber, :hv_logMember;
+			redoGroupFlag = FALSE;
+			for(i=0; i < redo1Counter; i++)
+			{
+                          if ( RedoLog1.redoGroupNum[i] == hv_logGroupNumber) redoGroupFlag=TRUE;
+			}
+                        if( redoGroupFlag == FALSE )                                    // Group is not part of the list 
+                        {
+				strcpy(RedoLog1.redoChangeNum[redo1Counter], hv_logFirstChangeSCN);
+				RedoLog1.redoGroupNum[redo1Counter]  = (unsigned int)hv_logGroupNumber;
+				strcpy(RedoLog1.redoLogMember[redo1Counter], (char *)hv_logMember.arr);
+                 
+                                Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+				Env.logIt(INFO, "Adding log member:\t\tSCN ==> ");
+				Env.logIt(INFO, RedoLog1.redoChangeNum[redo1Counter]);
+				Env.logIt(INFO, "\tGROUP ==> ");
+ 				Env.logIt(INFO, (unsigned int)RedoLog1.redoGroupNum[redo1Counter]);
+				Env.logIt(INFO, "\tMEMBER ==> ");
+			  	Env.logIt(INFO_CR, (char*) RedoLog1.redoLogMember[redo1Counter]); 
+
+				RedoLog1.status[redo1Counter] = 1;
+				LastFetchedGroupNumber = (unsigned int)hv_logGroupNumber;
+                                if(StartupFlag == FALSE)
+                                {
+	                          EXEC SQL EXECUTE 
+                                     BEGIN
+                            	      DBMS_LOGMNR.ADD_LOGFILE( LOGFILENAME => :hv_logMember,  OPTIONS => DBMS_LOGMNR.NEW);
+                                     END;
+                         	  END-EXEC;
+			          StartupFlag=TRUE;
+                                }
+                                else
+                                {
+	                          EXEC SQL EXECUTE 
+                                     BEGIN
+                            	      DBMS_LOGMNR.ADD_LOGFILE( LOGFILENAME => :hv_logMember,  OPTIONS => DBMS_LOGMNR.ADDFILE);
+                                     END;
+                         	  END-EXEC;
+                                }
+                        }
+                        redo1Counter++;                                                 // Increment the number of logs we ..
+			                                                                // are keeping track of
+                }
+  		EXEC SQL CLOSE C1; 
+              
+                //============================================================================== 
+                // The following is a fudge factor being introduced. The reason being, logminer
+                // uses SCN's. But we do all our processing against the committed SCN.
+                // If we call logminer with the last committed SCN, then we might miss transactions
+                // that fall between the SCN and the CSCN
+                //============================================================================== 
+                EXEC SQL SELECT (:hv_WorkingSCN - 100 ) into :hv_MinerSTARTSCN from dual;  // fudge factor
+                
+                //-------------------------------------------------------------
+                // 7.6.07 - Aside from being idle, this section is also a good
+                //          place to switch queues since we're starting a new
+                //          trans and not in the middle of one
+                //-------------------------------------------------------------
+                if(glb_switchState == TRUE)
+                {
+                   Rc=switchQueue(numberOfQueues, (char*) queueDir.c_str());
+                   Env.writeStatsToFile(lg_stat);
+                   Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                   Env.logIt(INFO, "queue group advanced to # ");
+                   Env.logIt(INFO_CR, Rc);
+                       
+                   glb_switchState = FALSE;
+                }
+                //============================================================================== 
+                Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                Env.logIt(INFO, ">>>>> Calling logminer <<<<< ");
+                Env.logIt(INFO, "\n\t\tSTARTSCN(working):\t");   Env.logIt(INFO, hv_MinerSTARTSCN );
+                Env.logIt(INFO, "\n\t\tENDSCN (KTUXE):\t");      Env.logIt(INFO, hv_KTUXE_SCN);     
+                if(strncmp(hv_CURRENT_SESSION_SCN, "999999999999999",15) == 0)
+                {
+                   Env.logIt(INFO, "\n\t\tCurrent Session SCN: ----\n"); 
+                }
+                else
+                {
+                   Env.logIt(INFO, "\n\t\tCurrent Session SCN: "); Env.logIt(INFO_CR, hv_CURRENT_SESSION_SCN);
+                }
+
+		EXEC SQL EXECUTE
+		    BEGIN
+  			SYS.DBMS_LOGMNR.START_LOGMNR(OPTIONS => SYS.DBMS_LOGMNR.COMMITTED_DATA_ONLY  +
+			         DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG,	
+                                 STARTSCN=> :hv_MinerSTARTSCN ,  
+                                 ENDSCN=>   :hv_KTUXE_SCN);
+                                 
+   		    END;
+		END-EXEC;
+               
+               logMinerStarted=TRUE;                                           // We did the start logminer
+
+                EXEC SQL OPEN CONTENT_CURSOR;
+
+		totalRowsFetched=0;
+		FetchedFlag = FALSE;
+                //-------------------------------------------------------------
+                // TIME to start fetching from v$logmnr_contents 
+                //-------------------------------------------------------------
+                while(redoLooper == TRUE)
+                {
+                   for(i=0; i < ARRAY_SIZE; i++)
+                   {
+        		memset(hv_sql_redo[i].arr,'\0', sizeof(hv_sql_redo[i].arr));
+        		memset(hv_sysdate[i].arr,'\0', sizeof(hv_sysdate[i].arr));
+                        memset(hv_scn[i], '\0', MAX_SCN_LENGTH);
+                        memset(hv_cscn[i],'\0', MAX_SCN_LENGTH);
+                   }
+		   EXEC SQL FETCH CONTENT_CURSOR INTO 
+                           :hv_scn:scn_ind, :hv_cscn:cscn_ind, :hv_sysdate:time_ind, :hv_csf:csf_ind, :hv_sql_redo:sql_ind;
+
+                   Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                   Env.logIt(INFO, "Rows fetched.1 : " );
+                   Env.logIt(INFO_CR, sqlca.sqlerrd[2] - totalRowsFetched );
+
+                   FetchedFlag = TRUE;
+		   MaxCSCN = PrintRows(sqlca.sqlerrd[2] - totalRowsFetched, scnBuffer);
+                   if ( strncmp(MaxCSCN,"0",1)  != 0) 
+                   {
+                      strcpy(hv_WorkingSCN, MaxCSCN);
+                   }
+                   
+                   Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                   Env.logIt(INFO, "Setting working SCN to ===> ");    
+                   Env.logIt(INFO_CR, hv_WorkingSCN );
+
+                   totalRowsFetched=sqlca.sqlerrd[2];
+                }                                                              // end while(redoLooper)
+
+                //-------------------------------------------------------------
+                // Grab the remainder of the records that exist in the array
+                //-------------------------------------------------------------
+                if ((sqlca.sqlerrd[2] - totalRowsFetched) > 0)                 
+                {
+                   Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                   Env.logIt(INFO, "Rows fetched.2 : " );
+                   Env.logIt(INFO_CR, sqlca.sqlerrd[2] - totalRowsFetched );
+
+                   FetchedFlag = TRUE;
+                   MaxCSCN = PrintRows(sqlca.sqlerrd[2] - totalRowsFetched, scnBuffer);
+                   if (strncmp(MaxCSCN,"0",1) != 0) 
+                   {
+                      strcpy(hv_WorkingSCN, MaxCSCN);
+                   }
+                   
+                   Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                   Env.logIt(INFO, "Setting working SCN to ===> ");    
+                   Env.logIt(INFO_CR, hv_WorkingSCN );
+                           
+                   totalRowsFetched=sqlca.sqlerrd[2];  // NEW
+                }
+		EXEC SQL CLOSE CONTENT_CURSOR;
+
+                //------------------------------------------------------------------------------
+                // Log maintenance 
+                //------------------------------------------------------------------------------
+  		EXEC SQL OPEN C2;                                                               // The C2 cursor uses hv_WorkingSCN
+		redo2Counter=0;
+                while(redoLooper == TRUE)                                                       // Do forever
+                {
+			EXEC SQL FETCH C2 INTO :hv_logFirstChangeSCN, :hv_logGroupNumber;
+
+                        for(i=0; i < redo1Counter; i++)                                         // For all the logs we know about
+                        {
+                           if( (RedoLog1.redoGroupNum[i]  ==  (unsigned int)hv_logGroupNumber)  && (RedoLog1.status[i] == 1) )
+                           {
+                              if ( strcmp(RedoLog1.redoChangeNum[i], hv_logFirstChangeSCN)  == 0 )
+                              {
+			         RedoLog1.status[i] = 2;
+                              }
+                           }
+                        }
+                 }
+                EXEC SQL CLOSE C2;
+                //------------------------------------------------------------------------------
+                for(i=0; i < redo1Counter; i++)                  
+                {
+                   if(RedoLog1.status[i] == 1)
+                   {
+                      Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                      Env.logIt(INFO, "Removing Log Member:");
+                      Env.logIt(INFO, "\tSCN ==> ");    Env.logIt(INFO, RedoLog1.redoChangeNum[i]);
+                      Env.logIt(INFO, "\tGROUP ==> ");  Env.logIt(INFO, RedoLog1.redoGroupNum[i]);
+                      Env.logIt(INFO, "\tMEMBER ==> "); Env.logIt(INFO_CR, RedoLog1.redoLogMember[i]);
+
+                      hv_logMember.len = (unsigned short)strlen(strcpy((char *)hv_logMember.arr,RedoLog1.redoLogMember[i]));
+                      RedoLog1.status[i] = -1;
+                      EXEC SQL EXECUTE 
+		               BEGIN
+			            DBMS_LOGMNR.ADD_LOGFILE( LOGFILENAME => :hv_logMember, OPTIONS => SYS.DBMS_LOGMNR.REMOVEFILE);
+		               END;
+                      END-EXEC;
+                   }
+                }                                                                       // for i = 0
+                //------------------------------------------------------------------------------
+                // Now lets reset the structure and the arrays within, so the info is contiguous 
+                //------------------------------------------------------------------------------
+		redo2Counter=0;
+                for(i = 0; i < redo1Counter; i++)
+                {
+		 if(RedoLog1.status[i] == 2)
+		 {
+                        strcpy(RedoLog2.redoChangeNum[redo2Counter],RedoLog1.redoChangeNum[i]);
+			RedoLog2.redoGroupNum[redo2Counter]  = RedoLog1.redoGroupNum[i];
+                        strcpy(RedoLog2.redoLogMember[redo2Counter],RedoLog1.redoLogMember[i]);
+                        RedoLog2.status[redo2Counter]        = 1;
+			redo2Counter++;
+
+                        Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                        Env.logIt(INFO, "Retaining log member:\tSCN ==> "); Env.logIt(INFO, RedoLog1.redoChangeNum[i]);
+                        Env.logIt(INFO, "\tGROUP ==> ");                  Env.logIt(INFO, RedoLog1.redoGroupNum[i]);
+                        Env.logIt(INFO, "\tMEMBER ==> ");                 Env.logIt(INFO_CR, RedoLog1.redoLogMember[i]);
+		 }
+                }
+                //--------------------------------------------
+                // Clean the rest of the structure...
+                //--------------------------------------------
+                for(i=redo2Counter; i < MAX_REDO_ENTRIES; i++)
+                {
+                   memset(RedoLog2.redoChangeNum[i],'\0', MAX_SCN_LENGTH );
+                   RedoLog2.redoGroupNum[i]  =  0;
+                   RedoLog2.status[i]        = -1;
+                }
+		RedoLog1 = RedoLog2;
+		redo1Counter = redo2Counter;
+       
+                //--------------------------------------------------------
+                // DO NOT REMOVE - No matter how tempted 
+                //                 We must keep track and assign the old transaction
+                //                 with the current system wide SCN
+                //--------------------------------------------------------
+                strcpy(hv_old_KTUXE_SCN, hv_KTUXE_SCN);  
+                //-----------------------------------------------------------------------------------
+		if(FetchedFlag == TRUE)                                  // Only increment fetch SCN if we just fetched.
+                {
+                     if (strncmp(hv_CURRENT_SESSION_SCN,"999999999999999",15)  == 0)
+                     {
+                        Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                        Env.logIt(INFO, "(fetched) Setting SCN to the system SCN (no active trans) : ");
+                        Env.logIt(INFO_CR, hv_KTUXE_SCN );
+                        strcpy(lg_stat.SCN, hv_KTUXE_SCN);
+                        Env.writeStatsToFile(lg_stat);
+                     }
+                     else
+                     {
+                        Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                        Env.logIt(INFO, "(fetched) Setting SCN to the working SCN (there's was an active trans) : ");
+                        Env.logIt(INFO_CR, hv_WorkingSCN );
+                        strcpy(lg_stat.SCN, hv_WorkingSCN);
+                        Env.writeStatsToFile(lg_stat);
+                     }
+                     //-------------------------------------------------------------------------------
+                     // Note, On next loop we don't want to wait so reset all sleep related variables
+                     //-------------------------------------------------------------------------------
+                     Env.logIt(INFO, "\t\tTotal rows fetched ");
+                     Env.logIt(INFO_CR, totalRowsFetched);
+
+                     if((batchRecords != 0) && ( totalRowsFetched < batchRecords))
+                     {
+		        sleepTime=minSleepTime;             
+                     }
+                     else
+                     {
+                        sleepTime=0;
+                     }
+                     sleepCounter=0;
+                }
+                //-----------------------------------------------------------------------------------
+                // 11.22.2004 - If there are no active transaction in the system, then we can bump up
+                // 10.20.2005 - but let's keep back a little, since oracle handles SCN's a little different
+                //              betweeen system wide transactions and the redo log
+                //-----------------------------------------------------------------------------------
+                else
+                {
+                    if (strncmp(hv_CURRENT_SESSION_SCN,"999999999999999",15)  == 0)            // Nothing going on in the system
+                    {
+                       //-------------------------------------------------------------
+                       // 7.6.07 - Aside from being idle, this section is also a good
+                       //          place to switch queues since we're starting a new
+                       //          trans and not in the middle of one
+                       //-------------------------------------------------------------
+                       if(glb_switchState == TRUE)
+                       {
+                          Rc=switchQueue(numberOfQueues, (char*) queueDir.c_str());
+                          Env.writeStatsToFile(lg_stat);
+                          Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                          Env.logIt(INFO, "queue group advanced to # ");
+                          Env.logIt(INFO_CR, Rc);
+                       
+                          glb_switchState = FALSE;
+                       }
+
+                       //---------------------------------------------------------------
+                       // 07.24.07 - Change STARTSCN -> hv_WorkingSCN to hv_MinerSTARSCN
+                       //---------------------------------------------------------------
+                       EXEC SQL EXECUTE
+                       BEGIN
+                          SYS.DBMS_LOGMNR.START_LOGMNR(OPTIONS => SYS.DBMS_LOGMNR.COMMITTED_DATA_ONLY  +
+                          DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG,	
+                          STARTSCN=> :hv_MinerSTARTSCN,  
+                          ENDSCN=>   :hv_KTUXE_SCN);
+   	       	       END;
+                       END-EXEC;
+
+                       EXEC SQL select nvl(to_char(max(cscn)),'NULL') into :hv_TEMP_SCN from v$logmnr_contents
+                                where    cscn >   :hv_WorkingSCN 
+                                AND      cscn <=  :hv_KTUXE_SCN 
+                                and      seg_owner = :hv_schemaOwner; 
+  
+                       if(strncmp(hv_TEMP_SCN,"NULL",4) == 0) 
+                       {
+                          strcpy(hv_TEMP_SCN, hv_KTUXE_SCN); // if nothing going on, then set to system wide
+                       }
+
+                       Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                       Env.logIt(INFO, "(system idle) Setting Working SCN set to last CSCN  ==> ");
+                       Env.logIt(INFO_CR, hv_TEMP_SCN );
+ 
+                       strcpy(lg_stat.SCN, hv_TEMP_SCN);
+                       Env.writeStatsToFile(lg_stat);
+                       strcpy(hv_WorkingSCN, hv_TEMP_SCN);
+                    }
+                    else
+                    {
+                       Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                       Env.logIt(INFO, "(no rows - active tran in progress) Setting Working SCN set to the active trans  ==> "); 
+                       Env.logIt(INFO_CR,  hv_CURRENT_SESSION_SCN);
+
+                       strcpy(lg_stat.SCN, hv_CURRENT_SESSION_SCN);
+                       Env.writeStatsToFile(lg_stat);
+                       strcpy(hv_WorkingSCN, hv_CURRENT_SESSION_SCN);
+                    }
+                }
+                //-----------------------------------------------------------------------------------
+		strcpy(hv_old_KTUXE_SCN, hv_KTUXE_SCN);
+                //-----------------------------------------------------------------------------------
+        }
+        else                                                    // the SYSSCN hasn't been bumped up, which means nothing going on
+        {
+          if(glb_switchState == TRUE)
+          {
+            Rc=switchQueue(numberOfQueues, (char*) queueDir.c_str());
+            Env.writeStatsToFile(lg_stat);
+            Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+            Env.logIt(INFO, "queue group advanced to # "); 
+            Env.logIt(INFO_CR, Rc); 
+
+            glb_switchState = FALSE;
+          }
+          sleepCounter++;
+          if(sleepCounter >= 5)
+          {
+            sleepCounter=0;
+            sleepTime++;                                                 // The longer no db activity, the longer we idle
+  	    if(sleepTime >= MAX_IDLE_TIME) sleepTime = MAX_IDLE_TIME;    // Make this the maximum idle time
+          }
+        }
+  }
+  
+  EXEC SQL WHENEVER NOT FOUND continue; 
+  EXEC SQL EXECUTE 
+	BEGIN
+	     SYS.DBMS_LOGMNR.END_LOGMNR;
+	END;
+  END-EXEC;
+
+  EXEC SQL COMMIT WORK RELEASE;
+  Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+  Env.logIt(INFO, "Done.\n");
+
+  exit(0);
+}
+
+
+//=============================================================================
+// Routine: PrintRows
+// Purpose:  Print records from the fetch array and then return the max SCN printed
+// 
+// MLV: 7.23.2008 - Moving sqlStr to global variable . Need to retain across
+//                  arrays
+//=============================================================================
+char* PrintRows(int n, char *MaxCSCN)
+{
+  unsigned int andPos=0, wherePos=0, nullPos=0, timeStampPos=0, rparenPos = 0, pos=0;
+  int  continueLooper=0;
+  std::string ErrorMsg;
+
+  int i=0;
+  for (i = 0; i < n; i++)                                                 // For the number of records in the array
+  {
+     if( strlen(hv_cscn[i]) > 1) strcpy(MaxCSCN,hv_cscn[i]);              // if it's set to some value, then record it 
+     else                        strcpy(MaxCSCN, "0");                    // ... else default to 0
+
+     //======================================================================
+     // 8.31.2007 - MLV
+     // Statements can exceed 4000 chars, so oracle sets a flag called csf
+     // to let us know if the current sql fragment is finished (csf=0) or
+     // if there's more in the next record (csf=1). However, since we're 
+     // collecting in host arrays, there might be a chance that the next 
+     // fragment is in the next batch, so we'll need to handle that. 
+     // Also, the while loop is used to handle the possibility in the future 
+     // that statements exceed 8000 chars, 12000 and so on.
+     //======================================================================
+     if( (sql_ind[i] == 0 && scn_ind[i] == 0) && (hv_sql_redo[i].len > 0) )  // the values aren't null and the length is > 0
+     {
+        if( glb_contFlag == 1 )                                              // Only set for spanned SQL
+        {
+           strcpy(MaxCSCN,hv_cscn[i]);
+           //-------------------------------------------
+           // DEBUG CODE
+           //-------------------------------------------
+           // std::cout << "SCN ==> " << MaxCSCN << std::endl;
+           // std::cout << "In global continuation [ should only be here during array breaks ]\n";
+           // std::cout << "i ===> " << i << " Saved SQL Fragment : " << sqlStr.substr(0, 80) << std::endl; 
+           //---------------------------------------------------------------------
+           // Global continuation flag is set to 1, which means the last statement
+           // in the last array was either a fragmented sql, or the next to last was
+           // fragmented, and the last was a commit.. which would be out of place
+           // However, if starting a new array, and the last in the old array was
+           // a fragment, and the next statement is a commit, we'll need to ignore
+           // that as well
+           //---------------------------------------------------------------------
+           Env.logIt (INFO, "\t\tGlobal continuation flag set (long sql spanned arrays)\n");
+           continueLooper=TRUE;
+           //----------------------------
+           // Drain until done
+           //----------------------------
+           while( continueLooper == TRUE )         
+           {
+              if(strncmp( (char*)hv_sql_redo[i].arr,"commit",6) != 0)     // not a commit
+              {                                                           // 
+                 sqlStr = sqlStr + ( (char*)hv_sql_redo[i].arr);          // .. so append the rest of the statement
+                 strcpy(MaxCSCN,hv_cscn[i]);
+                 //-------------------------------------------
+                 // DEBUG CODE
+                 //-------------------------------------------
+                 //std::cout << "SCN ==> " << MaxCSCN << std::endl;
+                 //std::cout << "i ===> " << i << " Appending fragments to sql string ==> " << hv_sql_redo[i].arr << std::endl;
+
+                 if (hv_csf[i] == 0)                                      // this valid fragment says its ok..no more 
+                 {
+                    //-------------------------------------------
+                    // DEBUG CODE
+                    //-------------------------------------------
+                    // strcpy(MaxCSCN,hv_cscn[i]);
+                    // std::cout << "SCN ==> " << MaxCSCN << std::endl;
+                    // std::cout << "i ==> " << i << " terminating because we got an hv_cfv =0\n";
+                    // std::cout << "COMPLETE SQL " << sqlStr << std::endl;
+                    //-------------------------------------------
+                    continueLooper=FALSE;
+                 }
+                 else
+                 {
+                    i++;
+                 }
+              }
+              else                                                        // don't unset continueLooper for a commit 
+              {
+                 //-------------------------------------------
+                 // DEBUG CODE
+                 //-------------------------------------------
+                 // strcpy(MaxCSCN,hv_cscn[i]);
+                 // std::cout << "SCN ==> " << MaxCSCN << std::endl;
+                 // std::cout << "i ===> " << i << " In bad commit routine : " << (char*)hv_sql_redo[i].arr << std::endl;
+                 //-------------------------------------------
+                 i++;
+                 Env.logIt (INFO, "\t\tIgnoring commit while continuation set to true\n"); //don't unset glb_continue
+              }
+           }
+           glb_contFlag=0;                                                // we're done draining
+        }
+        else                                                                 // This isn't the start of a new array !
+        {
+           if( hv_csf[i] == 1)                                               // statement is a fragment
+           {
+              sqlStr.clear();                                                // Clear the string buffer
+              continueLooper=TRUE;                                           // and force enter the loop
+              while( continueLooper==TRUE )                                  // continue until we have the complete statement 
+              {
+                 if(strncmp( (char*)hv_sql_redo[i].arr,"commit",6) != 0)     // not a commit, so we can process the row 
+                 {                                                           
+                    sqlStr = sqlStr + ( (char*)hv_sql_redo[i].arr);          // Append sql fragment to our constructed sql
+                    if (hv_csf[i] == 0)                                      // there's no more
+                    {
+                       continueLooper=FALSE;
+                    }
+                    else                                                     // Statements still have pieces remaining 
+                    {
+                       if( (i+1) == n )                                      // There's more, but we're at the end of the array
+                       {
+                          //-------------------------------------------
+                          // DEBUG CODE
+                          //-------------------------------------------
+                          // std::cout << "SCN ==> " << MaxCSCN << std::endl;
+                          // std::cout << "i ===> " << i << " Setting GLB Flag for ==> " << sqlStr.substr(0, 80) << std::endl; 
+                          // std::cout << "==== PREV STATEMENT ====\n" << "i  at ===> " << (i-1);
+                          // std::cout << (char*)hv_sql_redo[i-1].arr << std::endl;
+                          //-------------------------------------------
+                          glb_contFlag=1;                                    // Set a glb flag that we need to continue ..
+                          return("0");                                       // Don't process further, we're at the last record
+                       }
+                       i++;                                                  // point to the next statement in the array 
+                    }
+                 }
+                 else                                                       // just send a message and ignore the commit
+                 {
+                    Env.logIt (INFO, "\t\tEncountered commit while not having complete statement\n"); //don't unset glb_continue
+                    i++;                                                    // point to the next statement in the array 
+                 }
+              }
+           }                                             // end if hv_csf
+           else                                                             // Statement is not a fragment 
+           {
+              sqlStr = std::string((char*)hv_sql_redo[i].arr);              // Regular statement.. add it 
+              sqlStr = sqlStr.substr(0, sqlStr.length()-1);                 // remove the semi-colon at the end
+           }
+        }
+
+        //-------------------------------------------------------------------
+        // if the SQL has a ROWID, then it means it's either a DELETE
+        // or UPDATE statement        
+        // INSERT statements have no ROWID
+        //-------------------------------------------------------------------
+        pos = sqlStr.find(" and ROWID",0);                                   // look for ROWID 
+
+        if ( pos != std::string::npos)                                       // Yup.. it's got ROWID, so probably UPDATE/DELETE
+        {
+           sqlStr = sqlStr.substr(0, pos);                                   // sql string is everything up to ROWID 
+
+           wherePos = sqlStr.find("where",0);                                // Look for 'where' in the string 
+           if(wherePos != std::string::npos)                                 // Yup.. we found 'where'
+           {
+              timeStampPos = sqlStr.find("UPDATE_TIME",wherePos);            // find the column called "UPDATE_TIME" after 'where'
+              andPos       = sqlStr.rfind("and", timeStampPos);              // the reverse "and" that comes before the column name
+              if( (timeStampPos != std::string::npos) && (sqlStr.find("TO_TIMESTAMP", wherePos) != std::string::npos) )
+              {                    
+                 rparenPos = sqlStr.find(")", timeStampPos);                 // There should be a TO_DATE function on the right
+                 if(rparenPos  != std::string::npos)
+                 {
+                    if(rparenPos + 1 == sqlStr.size())                       // If this column is the last col referenced then...
+                       sqlStr = std::string(sqlStr.substr(0, andPos));
+                    else
+                       sqlStr = std::string(sqlStr.substr(0, andPos)) +  " " + sqlStr.substr(rparenPos+1);
+                 }
+              }
+           }
+           //-------------------------------------------------------------------
+           // Delete statement, on index organized tables, have "and "" IS NULL" 
+           // we're going to strip this out 
+           //-------------------------------------------------------------------
+           pos = sqlStr.find("and \"\" IS NULL");
+           if(pos != std::string::npos)                                        // yup.. we've got a strangely formated sql statement
+           {
+             if ( pos + 14 < sqlStr.length() )                                // 14 is the length of "and "" IS NULL"
+                sqlStr = sqlStr.substr(0, pos) + sqlStr.substr(pos+14);       // add the end - if any 
+             else
+                sqlStr = sqlStr.substr(0, pos);                               // Just take the end
+           } 
+        }
+        //-------------------------------------------------------------------- 
+        // ELSE - This is an insert statement 
+        //-------------------------------------------------------------------- 
+        else
+        {
+          pos = sqlStr.find(",\"\")",0);                                      // look for the weird sql "" 
+          if(pos != std::string::npos)                                        // yup.. we've got a strangely formated sql statement
+          {
+            if(sqlStr.compare(0,6,"insert")==0)                               // and we've confirmed it's an insert statement
+            {
+              nullPos = sqlStr.rfind(",NULL)", sqlStr.length());
+              if(nullPos != std::string::npos)       
+              {
+                sqlStr = sqlStr.substr(0, pos) + ")" + 
+                         sqlStr.substr(pos+4, (sqlStr.length() - (pos+4) ) - (sqlStr.length() - nullPos) ) + ")";
+              }
+              else
+              {
+                Env.logIt(INFO, "ERROR : logminer returned an badly formatted statement - Null not found\n");
+              }
+            }
+            else
+            {
+               Env.logIt(INFO, "ERROR : logminer returned an badly formatted statement - insert statement\n");
+            }
+          }
+        }
+	glb_queuefile << "--" << MaxCSCN << " | " << hv_sysdate[i].arr << std::endl << sqlStr << "\nEND SQL\n"; 
+     }
+  }
+  glb_queuefile.flush();
+  return(MaxCSCN);
+}
+//=============================================================================
+// Routine: Cleanup
+// Purpose: We've received a signal 16 (SIGUSER1), which means quit out right
+//          away (hard quit)
+//=============================================================================
+void Cleanup(int)
+{
+ char timeBuffer[TIME_BUF_LN];
+ Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+ Env.logIt(INFO, "\tlg_ext(ractor) terminating at signal.\n");
+ exit(0);
+}
+
+//=============================================================================
+// Routine: sql_proc
+// Purpose: Depending on the flag sent, we'll either connect to oracle, of 
+//          otherwise, we've encountered an oracle error and we'll need to deal
+//          with it.
+//=============================================================================
+int sql_proc(int connectFlag, char *inMsg)
+{
+   int Rc, Looper=TRUE;
+   char timeBuffer[TIME_BUF_LN];
+
+   EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+    if(connectFlag == TRUE)
+    {
+         EXEC SQL CONNECT :username IN SYSDBA MODE;
+         Rc=sqlca.sqlcode;
+         switch(Rc)
+         {
+              case    0:
+                          Env.logIt(INFO, "(connected)\n");
+                          Looper=FALSE; 
+                          return(TRUE);
+                          break;
+              case -1012:
+              case -1014:
+              case -1033:
+              case -1034:
+              case -1035:
+              case -1089:
+              case -1090:
+              case -1092:
+                          EXEC SQL ROLLBACK RELEASE;
+                          fflush(NULL);
+                          exit(2);
+                          break;
+               default  : 
+                          Env.logIt(INFO, "\tERROR : \n");
+                          Env.logIt(INFO_CR, inMsg);
+                          Env.logIt(INFO_CR, sqlca.sqlerrm.sqlerrmc); 
+                          EXEC SQL ROLLBACK RELEASE;
+                          exit(1);
+    
+         } // END SWITCH
+         return(FALSE);
+    }  
+    else
+    {
+         Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+         Env.logIt(INFO, "ERROR : ");
+         Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+         Env.logIt(INFO_CR, inMsg); 
+         Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+         Env.logIt(INFO_CR, sqlca.sqlerrm.sqlerrmc);
+         EXEC SQL ROLLBACK RELEASE;
+         exit(1);
+    }
+
+    return(TRUE);
+}
+//=============================================================================
+// Routine: switchQueue
+// purpose: when we receive the signal, and we are idle, the come here and 
+//          switch to the next queue. We used to terminate, wait until the queue cleared
+//          but this is a better approach as we can continue to process
+// 
+//=============================================================================
+int switchQueue(int numberOfQueues, char queueDir[])
+{
+  int queueNumber=(lg_stat.queueNumber + 1) % numberOfQueues;
+  if ( queueNumber == 0)
+  {
+     queueNumber=numberOfQueues;                           //  ie. if the previous was 2 (out of 3), now its 0 
+  }                                                        //  so we set it to the max number of logs supported
+  lg_stat.queueNumber=queueNumber;
+
+  char tempString[MAX_TMP_LN];
+  memset(tempString, '\0', MAX_TMP_LN);
+  sprintf(tempString,"%05d", queueNumber);
+
+  std::string queueFile = std::string(queueDir) + "/queue" + tempString;
+
+  glb_queuefile.close();
+  glb_queuefile.open(queueFile.c_str(), std::ios::out | std::ios::app);
+
+  return(queueNumber); 
+}
+
+//=============================================================================
+// Routine: Wakeup
+// Purpose: When we gets a signal 17 (SIGUSER2), this means we want to cleanup
+//          Instead of doing a hard stop, we'll set a flag, hit the sleep routine
+//          and switch to a different log file
+//=============================================================================
+void Wakeup(int)
+{
+  char  timeBuffer[TIME_BUF_LN];
+  Env.logIt(TIME,  Env.timeNow(timeBuffer, TIME_BUF_LN));
+  Env.logIt(INFO, "Wakeup:\tsignal 17\n");
+  glb_switchState=TRUE;
+}

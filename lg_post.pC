@@ -1,0 +1,1109 @@
+#include <iostream>
+#include <stdio.h>
+#include <strings.h>
+#include <string>
+#include <errno.h>
+#include <fcntl.h>
+#include <fstream>
+#include <oraca.h>
+#include <setjmp.h>
+#include <sqlda.h>
+#include <sqlca.h>       // CHANGED - added to original program
+#include <stdlib.h>
+#include <sqlcpr.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <dirent.h>
+#include "lg_post.h"
+#include "lg_common.cpp"
+#include "lg_postFiles.cpp"
+#include "lg_formatSQL.cpp"
+
+lg_Statistics lg_stat;
+
+
+
+EXEC SQL BEGIN DECLARE SECTION;
+
+    char            *username="/";  
+    //--------------------------------------------------------------
+    // Following used for stats
+    //--------------------------------------------------------------
+    unsigned long   hv_sid, hv_serial, hv_expiration_time;
+    int             timestamptest;
+    varchar         hv_logon_time[30];
+    char            dyn_statement[LONG_SQL_STRING];
+    char            hv_dynstmt2[LONG_SQL_STRING];
+    EXEC SQL VAR dyn_statement IS STRING(16384);
+EXEC SQL END DECLARE SECTION;
+
+formatSQL fmt;
+Environment Env;                                                               // Calling env globally
+
+int main(int argc, char* argv[])
+{
+    int i=0;
+    int  sleepTime=1, sleepCounter=0;
+    char timeBuffer[TIME_BUF_LN];
+    unsigned long oldQueueOffset=0;
+
+    //--------------------------------------------------------------------------------------
+    // Do the signal setup  
+    //--------------------------------------------------------------------------------------
+    signal(SIGUSR1, &Cleanup);
+    sigset(SIGUSR1, &Cleanup);
+    signal(SIGUSR2, &Wakeup);
+    sigset(SIGUSR2, &Wakeup);
+    sigignore(SIGHUP);
+    sigignore(SIGINT);
+    sigignore(SIGALRM);
+   
+    //---------------------------------------------------------
+    std::string lg_home, oracleBase;
+    if( Env.getEnv(lg_home, oracleBase) != TRUE)
+    {
+      std::cerr << Env.error() << std::endl; 
+      exit(1);
+    }
+
+    //---------------------------------------------------------
+    // Set the environment
+    //---------------------------------------------------------
+    if( Env.setEnv("lg_post", lg_home, oracleBase) != TRUE)
+    {
+      std::cerr << "Could not set the environment" << std::endl;
+      exit(1);
+    }
+
+    //---------------------------------------------------------
+    // First, attempt to open the log
+    //---------------------------------------------------------
+    std::string logFileName;
+    if( Env.readConfig("logfile", logFileName) != TRUE)
+    {
+      std::cerr << "Terminating: logfile is not specified in the configuration file." << std::endl;
+      exit(1);
+    }
+    Env.openLog(logFileName);
+
+
+
+    //---------------------------------------------------------
+    // Populate variables with the contents of the conf file 
+    // Datafile - aka the queue file
+    //---------------------------------------------------------
+    std::string lockFile;                                                        // standard issue lockfile
+    if( Env.readConfig("lockfile", lockFile) != TRUE)
+    {
+       Env.logIt(INFO, "(error)\nLock file is not specified in the configuration file. Aborting.\n");
+       exit(1);
+    }
+
+    std::string statFile;                                                        // record statistics 
+    if( Env.readConfig("statfile", statFile) != TRUE)
+    {
+       Env.logIt(INFO, "(error)\nStat file is not specified in the configuration file. Aborting.\n");
+       exit(1);
+    }
+
+    //-----------------------------------------------------------
+    // Get  the queue file name from the conf file
+    //-----------------------------------------------------------
+    std::string queueDir;
+    if( Env.readConfig("queue_directory", queueDir)  != TRUE)
+    {
+       Env.logIt(INFO, "(ERROR)\n\t\tData directory not specified in the configuration file\n");
+       exit(1);
+    }
+
+    if(argc > 1)
+    {
+       if(argc == 3)
+       {
+          if(strcmp(argv[1],"-i")==0)
+          {
+             Env.initStatFile(statFile.c_str(), atol(argv[2]));
+             Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+             Env.logIt(INFO, "Stat file initialized\n");
+             exit(0);     
+          }       
+          else
+          {
+             std::cerr << "Invalid arguments passed to lg_post\n";
+             exit(1);
+          }
+       }
+       else
+       {
+         std::cerr << "Invalid arguments passed to lg_post\n";
+         exit(1);
+       }
+    }
+    //-----------------------------------------------------
+    // WHat's the max number of queue logs we support
+    //-----------------------------------------------------
+    std::string configFileBuffer;
+    int numberOfQueues=0;
+
+    if( Env.readConfig("queue_groups", configFileBuffer)  != TRUE)
+    {
+       numberOfQueues=3;
+       Env.logIt(INFO, "(WARNING)\n\tThe number of queue files is not specified in config file: Defaulting to 3\n");
+    }
+    else
+    {
+       numberOfQueues=atoi(configFileBuffer.c_str());
+       if((numberOfQueues < 1) || (numberOfQueues > 12))
+       {
+          Env.logIt(INFO, "(WARNING)\n\tInvalid number of queue files specified in config file: Defaulting to 3\n");
+          numberOfQueues=3;
+       }
+    }
+
+    //---------------------------------------------------------
+    // The schema owner
+    //---------------------------------------------------------
+    std::string schemaOwner;
+    if( Env.readConfig("schema_owner", schemaOwner) != TRUE)
+    {
+       Env.logIt(INFO, "(error)\nParameter 'SchemaOwner' is not specified in the configuration file.  Aborting.\n");
+       exit(1);
+    }
+    
+    //---------------------------------------------------------
+    // The location of the index file  
+    //---------------------------------------------------------
+    std::string indexFileName;
+    if( Env.readConfig("index_file_name", indexFileName) != TRUE)
+    {
+       Env.logIt(INFO, "(error)\nParameter 'indexFileName' is not specified in the configuration file.  Aborting.\n");
+       exit(1);
+    }
+    
+    Env.logIt(INFO, "(ok)\n");
+
+    //---------------------------------------------------------
+    // Check to make sure we aren't locked out
+    //---------------------------------------------------------
+    Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_PAD, "Checking lock ");
+    if( Env.checkLock(lockFile.c_str()) == TRUE)
+    {
+       Env.logIt(INFO, "(error)\nTerminating: lockfile\n");
+       exit(1);
+    }
+    Env.logIt(INFO, "(ok)\n");
+    
+    //---------------------------------------------------------
+    // We need the unique index file. This will be used
+    // for resolving logical conflicts
+    //---------------------------------------------------------
+    Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_PAD, "Initlializing index queue");
+    if( fmt.initialize(indexFileName.c_str()) != TRUE)
+    {
+       Env.logIt(INFO, "(ERROR)\nTerminating: index file not found\n");
+       exit(1);
+    }
+    Env.logIt(INFO, "(ok)\n");
+
+    //---------------------------------------------------------
+    // The stat file holds the offset (in bytes) into the data queue
+    // This is used for startup 
+    //---------------------------------------------------------
+    Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_PAD, "Opening statistics file ");
+    if (Env.mapIt(statFile.c_str()) != TRUE)
+    {
+       Env.logIt(INFO, "(ERROR)");
+       Env.logIt(INFO, Env.error() ); 
+       exit(1);
+    } 
+    Env.logIt(INFO, "(ok)\n");
+    Env.logIt(INFO, "\t\tStats File : ");
+    Env.logIt(INFO_CR, (char*)statFile.c_str());
+    
+    //---------------------------------------------------------
+    // Open the stat file and read where we last left off
+    //---------------------------------------------------------
+    unsigned long fileLength=0;
+    Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_PAD, "Retrieving saved offset and scn ");
+
+    if(Env.readStatsFromFile(lg_stat) != TRUE)
+    {
+      Env.logIt(INFO, "(warning)\nCould not retrieve offset and SCN. Setting to default of 0\n");
+      strcpy(lg_stat.SCN,"0");
+      lg_stat.fileOffSet=0;
+    }
+    Env.logIt(INFO, "(ok)\n");
+  
+    char tempStr[12];
+
+    memset(tempStr,'\0', sizeof(tempStr));
+
+    //---------------------------------------------------------
+    // Report stats from last time 
+    //---------------------------------------------------------
+    sprintf(tempStr, "%ld", lg_stat.fileOffSet);
+    strcat(tempStr,"\n");
+    Env.logIt(INFO, "\t\tLast saved offset into queue : ");
+    Env.logIt(INFO, tempStr);
+    
+    Env.logIt(INFO, "\t\tLast recoded SCN             : ");
+    Env.logIt(INFO, lg_stat.SCN);
+    Env.logIt(INFO, "\n");
+    
+    Env.logIt(INFO, "\t\tLast recorded queue group    : ");
+    Env.logIt(INFO, lg_stat.queueNumber);
+    Env.logIt(INFO, "\n");
+    
+    //---------------------------------------------------------
+    // Check to see if we can access the queue
+    //---------------------------------------------------------
+    char tempString[MAX_TMP_LN];
+    memset(tempString,'\0', MAX_TMP_LN);                                      // Reside on a word boundary 4, 8, 12
+    sprintf(tempString,"%05d", lg_stat.queueNumber);
+    std::string queueFile=std::string(queueDir) + "/queue" + tempString;
+    glb_queuefile.open(queueFile.c_str(), std::ios::in);
+    if(! glb_queuefile)
+    {
+       Env.logIt(INFO, "\t\tERROR - Could not open queue for reading: ");
+       Env.logIt(INFO_CR,  (char*)queueFile.c_str());
+       exit(1);
+    }
+    else
+    {
+       glb_queuefile.seekg(lg_stat.fileOffSet);                    // Go back to where we last left off 
+    }
+
+    //---------------------------------------------------------
+    // Trying to connect to the database
+    //---------------------------------------------------------
+    Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_PAD, "Connecting to RDBMS ");
+    if (oracle_connect() != TRUE) 
+    {
+       exit(2);                                     
+    }
+    Env.logIt(INFO, "(ok)\n");
+
+    //---------------------------------------------------------------
+    // Record the connection status. Used to supress echoing of data
+    //---------------------------------------------------------------
+    Env.logIt(TIME,     Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_PAD, "Recording connection status (sid, serial)");
+
+    EXEC SQL WHENEVER NOT FOUND DO sql_error(EXIT, "(ERROR)\n Not found : in select from v$session\n");
+    EXEC SQL WHENEVER SQLERROR  DO sql_error(EXIT, "(ERROR)\n RDBMS error: in select from v$session\n");
+    oraca.orastxtf = ORASTFERR;
+
+    EXEC SQL SELECT nvl(SID,0), nvl(SERIAL#,0), nvl(LOGON_TIME,sysdate) into hv_sid, hv_serial, hv_logon_time
+             FROM v$session
+             WHERE username = 'SYS'
+             AND   program like 'lg_post.exe%';
+    
+    EXEC SQL INSERT INTO system.post_stats(SESSION#, SERIAL#, LOGON_TIME, LAST_SCN)
+           VALUES (:hv_sid, :hv_serial, :hv_logon_time, 0);
+
+    EXEC SQL COMMIT;
+
+    Env.logIt(INFO, hv_sid); 
+    Env.logIt(INFO, ",");
+    Env.logIt(INFO_CR, hv_serial);
+
+    if (alloc_descriptors(MAX_ITEMS, MAX_VNAME_LEN, MAX_INAME_LEN) != 0) exit(1);
+
+    int           Rc=NORMAL;                                                   // set processing mode to 'normal'
+    unsigned int  dotprint=0;
+    unsigned long rows=0;
+
+    //---------------------------------------------------------
+    // Put something in the log stating that we are starting
+    //---------------------------------------------------------
+    Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+    Env.logIt(INFO_CR, ">>>>> Begin lg_post.exe");
+    //---------------------------------------------------------
+
+    unsigned int looper=1;
+
+    while(looper==1)                                                           // do forever 
+    {
+        (void) setjmp(jmp_continue);                                           // placeholder to jump to
+
+        if(Env.writeStatsToFile(lg_stat) != TRUE)                              // Record offset into file. Used for restarts
+        {
+          Env.logIt(INFO, "ERROR: Could not record offset and SCN info");
+          exit(1);
+        }
+
+        //----------------------------------------------------------------------
+        // If the SQL return code is not 0 and we were in the midst of regular
+        // processing, the go into this 'if' statement. 
+        //----------------------------------------------------------------------
+        if(sqlRc != 0 && Rc == NORMAL)                                         // did we encounter a prior error
+        {
+           //---------------------------------------------------
+           // If we get a NOT FOUND or PK error, try to resolve
+           //---------------------------------------------------
+           if(sqlRc == 1403 || sqlRc == -1)       
+           {
+             //-----------------------------------------------------------------------------
+             // Try to create a statement from existing information. ie. an insert 
+             // can be converted to an update by chaging the syntax
+             //-----------------------------------------------------------------------------
+             if(resolveConflict(schemaOwner, Env.timeNow(timeBuffer, TIME_BUF_LN)) == TRUE) 
+             {
+                Env.logIt(INFO, "\t\tNOTE: Issuing conflict resolution statement\n");
+                Rc=RESOLVE;                                                      // set processing mode to 'resolve'
+             }
+             //-----------------------------------------------------------------------------
+             // There just wasn't enough information in the original statement to create 
+             // a complimentary resolution statement
+             //-----------------------------------------------------------------------------
+             else
+             {
+                Rc=IGNORE;                                                     // we want to bypass the (if rc==0) code below
+             }
+          }               // end if sqlRc
+          //-------------------------------------------------------------------
+          // Let the user know that the only codes we support are 1403 and -1
+          //-------------------------------------------------------------------
+          else                                                                 // Only codes we work with are 1403 or 1
+          {
+             Env.logIt(INFO_PAD, "\t\tunsupported sqlcode ");  
+             sprintf(tempStr, "%ld", sqlRc);
+             Env.logIt(INFO_CR, tempStr);
+             Rc=IGNORE;
+          }
+          sqlRc=0;
+        }
+        //---------------------------------------------------------------------
+        // Get the next statement in the queue
+        //---------------------------------------------------------------------
+        else                                                           
+        {
+           oldQueueOffset=lg_stat.fileOffSet;                                  // Record the last offset before getting statement 
+           Rc=get_dyn_statement();
+           if(Rc == -1) exit(1);
+        }
+
+        //=====================================================================
+        if( (Rc==NORMAL) || (Rc == RESOLVE) || (Rc == COMMIT_WORK) || (Rc == DDL) )
+        {
+           sleepTime=1;                                                        // reset the sleep counter 
+
+           EXEC SQL WHENEVER SQLERROR DO sql_error(CONTINUE, "ERROR : in main - ");
+           EXEC SQL WHENEVER NOT FOUND DO sql_error(CONTINUE, "\n Not found\n");
+
+           switch(Rc)
+           {
+            case COMMIT_WORK:
+                             Rc=NORMAL; 
+                             break;
+            case DDL:
+                             Env.logIt(INFO_CR, dyn_statement);
+                             if( strlen(dyn_statement) != 0)
+                             {
+                               EXEC SQL EXECUTE IMMEDIATE :dyn_statement;        // Execute the DDL statement immediately
+                             }
+                             else
+                             {
+                                Env.logIt(INFO,"\t\tEncountered unexpected blank statement for ddl command\n");      
+                             }
+                             Rc=NORMAL; 
+                             break;
+            default :        // NORMAL OR RESOLVE
+                             if( strlen(dyn_statement) != 0)
+                             {
+                                parse_flag = 1;                                   // Set a flag for sql_error(). 
+                                EXEC SQL PREPARE S FROM :dyn_statement;
+                                parse_flag = 0;                                   // Unset the flag. 
+                  
+                                EXEC SQL DECLARE C CURSOR FOR S;
+                                set_bind_variables();
+     
+                                EXEC SQL OPEN C USING DESCRIPTOR bind_dp;         // if error on this statement, we go to sqlerror
+                                if(sqlca.sqlcode != 0) sql_error(CONTINUE, "\t\tStatement Error - ");
+                   
+                                rows++;
+                                if( (rows % MOD_ROWS) == 0)
+                                {
+                                   Env.logIt(INFO,".");                            // print out dots to show progress  
+                                   dotprint++;
+                         	   if(dotprint % 80 == 0) Env.logIt(INFO,"\n");    // carriage return after 80 dots ...
+                                   EXEC SQL COMMIT;                                // Commit every 'x' number of records
+                                }
+                             } 
+                             else
+                             {
+                                Env.logIt(INFO_CR,"\t\tEncountered unexpected blank statement for dml command");
+                                Env.logIt(INFO,"\t\tOffset                 : ");
+                                sprintf(tempString,"%ld", lg_stat.fileOffSet);
+                                Env.logIt(INFO_CR, tempString);
+
+                                Env.logIt(INFO,"\t\tSetting offset back to : ");
+                                sprintf(tempString,"%ld", oldQueueOffset);
+                                Env.logIt(INFO_CR, tempString);
+                                
+                                Env.logIt(INFO,"\t\tRC from dynamic SQL : ");
+                                sprintf(tempString,"%d", Rc);
+                                Env.logIt(INFO_CR, tempString);
+
+                                sleep(1);                                      // Give the imp a chance to catch up
+                                lg_stat.fileOffSet=oldQueueOffset;
+                             }
+           } 
+
+         }
+         else                                                                  // we hit the EOF 
+         {
+            if( (Rc == IDLE) || (Rc == ENDSQL) )
+            {
+              if(rows >= 1)
+              {
+                dotprint=0;
+               // if(rows >= MOD_ROWS)
+               // {
+               //   Env.logIt(INFO, "\n");
+               // }
+                memset(tempStr,'\0', sizeof(tempStr));
+                sprintf(tempStr, "%lu\n", rows);
+                Env.logIt(INFO, "\n");
+                Env.logIt(TIME,  Env.timeNow(timeBuffer, TIME_BUF_LN));
+                Env.logIt(INFO_PAD, "Total Rows processed ");
+                Env.logIt(INFO, tempStr); 
+             
+                EXEC SQL COMMIT;                                                 // also commit when we've hit an EOF
+              }
+
+              rows=0;
+              int sizeLooper=TRUE;
+              while(sizeLooper == TRUE)
+              {
+
+                 sleepCounter++;
+                 if(sleepCounter >= 5)
+                 {
+                    sleepCounter=0;
+                    sleepTime++;                                               // The longer no db activity, the longer we idle
+                    if(sleepTime >= MAX_IDLE_TIME) sleepTime = MAX_IDLE_TIME;  // Make this the maximum idle time
+                 }
+                 sleep(sleepTime);
+            
+                 glb_queuefile.clear();                                        // clear the eof or error flag
+                 glb_queuefile.seekg(0, std::ios::end);                        // go to the end
+                 fileLength = glb_queuefile.tellg();                           // how big am I ?
+
+                 if(fileLength > lg_stat.fileOffSet)                           // are there new records ?
+                 {
+                   sizeLooper=0;
+                   glb_queuefile.seekg(lg_stat.fileOffSet);                    // Go back to where we last left off 
+                   Env.logIt(TIME,  Env.timeNow(timeBuffer, TIME_BUF_LN));
+                   Env.logIt(INFO, "Wakeup:\t\ttransactions\n");
+                 }
+                 else                                                          // There are no new records
+                 {
+                    if(glb_switchState == TRUE)                                // and we were told to switch
+                    {
+                       Rc=switchQueue(numberOfQueues, (char*) queueDir.c_str());
+                       lg_stat.fileOffSet = 0;
+                       lg_stat.queueNumber = Rc;
+                       Env.writeStatsToFile(lg_stat);
+
+                       Env.logIt(TIME, Env.timeNow(TimeBuffer,20) );
+                       Env.logIt(INFO, "queue group advanced to # ");
+                       Env.logIt(INFO_CR, Rc);
+
+                       glb_switchState=FALSE;
+                       glb_queuefile.clear();                                  // clear the eof or error flag
+                    }
+                 }
+              }
+            }                                                                // end while
+         }                                                                   // end else (rc==0)
+    }                                                                        // end of for(;;) statement-processing loop 
+
+    //-------------------------------------------------------------------------
+    // C L E A N U P 
+    //-------------------------------------------------------------------------
+    for (i = 0; i < MAX_ITEMS; i++)
+    {    
+        if (bind_dp->V[i] != (char *) 0)
+            free(bind_dp->V[i]);
+        free(bind_dp->I[i]);                                                   // MAX_ITEMS were allocated. 
+        if (select_dp->V[i] != (char *) 0)
+            free(select_dp->V[i]);
+        free(select_dp->I[i]);                                                 // MAX_ITEMS were allocated.
+    }
+
+    //--------------------------------------------------
+    // Free space used by the descriptors themselves. 
+    //--------------------------------------------------
+    sqlclu(bind_dp);
+    sqlclu(select_dp);
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+    EXEC SQL CLOSE C;
+
+    EXEC SQL COMMIT WORK RELEASE;
+    Env.logIt(INFO, "Terminating: exit \n");
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error(EXIT, "end");
+    return(1);
+}
+
+//-----------------------------------------------------------------------------
+// This routine is taken directly from the pro*c demo in sample10.pc
+//-----------------------------------------------------------------------------
+int alloc_descriptors(int size, int max_vname_len, int max_iname_len)
+{
+    int i;
+
+    if ((bind_dp = sqlald(size, max_vname_len, max_iname_len)) == (SQLDA *) 0)
+    {
+        fprintf(stderr, "Cannot allocate memory for bind descriptor.");
+        return -1;                                                             // Have to exit in this case. 
+    }
+
+    if ((select_dp = sqlald (size, max_vname_len, max_iname_len)) == (SQLDA *) 0)
+    {
+        fprintf(stderr, "Cannot allocate memory for select descriptor.");
+        return -1;
+    }
+    select_dp->N = MAX_ITEMS;
+
+    for (i = 0; i < MAX_ITEMS; i++) 
+    {
+        bind_dp->I[i] = (short *) malloc(sizeof (short));
+        select_dp->I[i] = (short *) malloc(sizeof(short));
+        bind_dp->V[i] = (char *) malloc(1);
+        select_dp->V[i] = (char *) malloc(1);
+    }
+       
+    return 0;
+}
+
+//-----------------------------------------------------------------------------
+// Changes: 1/2007 MLV - Adding DDL support to the poster. The extractor does
+//                       not provide DDL, but will be coming in from alternate
+//                       sources, such as ddl patches. In this initial release
+//                       we will try to support ALTER statement and SELECT 
+//                       statements
+//
+// Returns: 1 = eof
+//          0 = got the statement
+///        -1 = 'exit' in file
+//          2 = commit;
+//          5 = ddl     
+//          6 = end sql
+//-----------------------------------------------------------------------------
+int get_dyn_statement()
+{
+    std::string linebuf;                                                       // used to be char linebuf[256]
+    unsigned int delimiter=0;
+
+    int iter=1;                                                                // used to handle statements that span multiple lines
+    int looper=1;
+    int Rc=NORMAL;
+
+    //--------------------------------------
+    // redundant: set values for vars
+    //--------------------------------------
+    iter=1;
+    looper=1; 
+    Rc=NORMAL;
+    //--------------------------------------
+    while(looper == 1)                                                         // while forever
+    {
+        if (iter == 1)                                                         // first time in the loop
+        {
+            linebuf.clear();                                                   // clear the inline buffer
+            memset(dyn_statement,'\0',sizeof(dyn_statement));                  // Changed: was dynstmt[0] = '\0'  
+            delimiter=0;                                                       // reset the delimiter variable
+        }
+
+        //-------------------------------
+        // READ FROM THE BUFFER
+        //-------------------------------
+        getline(glb_queuefile, linebuf, '\n');                              // <<<<==== READ 
+
+        //-----------------------------------------------------
+        // If we're at the end of the file, then just return
+        //-----------------------------------------------------
+        if(glb_queuefile.eof() == 1)                                        // At the EOF ?
+        {
+           if( iter ==1 ) return(IDLE);  
+           else           return(0);
+        }
+        else 
+        {
+           lg_stat.fileOffSet+=linebuf.length()+1;                          // set the total offset to: offset + line
+        }
+
+        //--------------------------------------------
+        // Value = EXIT ?
+        //--------------------------------------------
+        if ((linebuf.compare("EXIT") == 0) || (linebuf.compare("exit") == 0))  // termination instruction from the file
+        {
+            return(-1);
+        }
+
+        //--------------------------------------------
+        // Value = '--' ?
+        // If this is a comment, then there's usually 
+        // information in the line that tells us things
+        // like SCN values and timestamps
+        //--------------------------------------------
+        if (linebuf.substr(0,2) == "--")                                       // if its a comment, get the SCN from the line
+        {
+           delimiter = linebuf.find("|", 0);
+           if(delimiter != std::string::npos)
+           {
+               SCN=std::string(linebuf.substr(3,delimiter-4));
+               if(SCN.length() == 0)                                           // Just adding some more safeguards. Same code as
+               {                                                               // below
+                  strcpy(lg_stat.SCN, "0");
+                  strcpy(TimeBuffer2,"01-JAN-1970 00:00:00");
+               }
+               else
+               {
+                  strcpy(lg_stat.SCN, SCN.c_str());
+                  timeStr = std::string("TO_DATE('") + linebuf.substr(delimiter+1) + "', 'DD-MON-YYYY HH24:MI:SS')";
+                  memset(TimeBuffer2,'\0', sizeof(TimeBuffer2));
+                  strcpy(TimeBuffer2, timeStr.c_str());
+               }
+           }
+           else
+           {
+              strcpy(lg_stat.SCN, "0");
+              strcpy(TimeBuffer2,"01-JAN-1970 00:00:00");
+           }
+        }
+        //--------------------------------------------
+        // The line isn't a comment. it could be a  
+        // continuation of an SQL statement, or instruction
+        // to process the SQL statement we have 
+        // via the END DDL or END SQL command
+        //--------------------------------------------
+        else
+        {
+           //--------------------------------------
+           // If END SQL, take what we have and
+           // return it to calling program
+           //--------------------------------------
+           if (  (linebuf.compare("END SQL") == 0) || (linebuf.compare("end sql") == 0) )
+           {
+              dmlOffset=lg_stat.fileOffSet - (linebuf.length() +1); 
+              if( strlen(dyn_statement) != 0) return(NORMAL);              // There's an sql statement - so return it
+              else                            return(ENDSQL);              // otherwise, we appear to be repeating an END SQL
+           }
+           else
+           {
+               //---------------------------------------------------
+               // The statement was an END DDL, which means we've
+               // got some special statements we want to handle
+               // via dynamic sql calls 
+               //---------------------------------------------------
+               if (  (linebuf.compare("END DDL") == 0) || (linebuf.compare("end ddl") == 0) )
+               {
+                  dmlOffset=lg_stat.fileOffSet - (linebuf.length() +1); 
+                  Rc=DDL;
+                  looper=0;                                                 // break out of the loop
+               }
+               else
+               {
+                  if(iter == 1) 
+                  {
+                    if(linebuf.compare("commit") == 0) 
+                    {
+                       commitOffset = lg_stat.fileOffSet - (linebuf.length() +1);
+                       Rc=COMMIT_WORK; 
+                    }
+                    else       
+                    {
+                       dmlOffset=lg_stat.fileOffSet - (linebuf.length() +1); 
+                    }
+                  }
+                  iter++;                                                      // display lines instead of "SQL >"
+                  strcat(dyn_statement, linebuf.c_str());                      // concat statement into our master sql statement
+               }
+           }
+        }
+    }
+    return(Rc);
+}
+
+
+//-----------------------------------------------------------------------------
+// This routine is taken directly from sample10.cpp with no modifications 
+//-----------------------------------------------------------------------------
+void set_bind_variables()
+{
+    int i, n;
+    char bind_var[64];
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error(EXIT, "ERROR : Setting bind variables \n");
+
+    bind_dp->N = MAX_ITEMS;                                                    // Initialize count of array elements. 
+    EXEC SQL DESCRIBE BIND VARIABLES FOR S INTO bind_dp;
+
+    if (bind_dp->F < 0)
+    {
+        printf ("\nToo many bind variables (%d), maximum is %d\n.", -bind_dp->F, MAX_ITEMS);
+        return;
+    }
+
+    bind_dp->N = bind_dp->F;                                                   // max # of array elements = # of descriptor found
+ 
+    for (i = 0; i < bind_dp->F; i++)
+    {
+        printf ("\nEnter value for bind variable %.*s:  ", (int)bind_dp->C[i], bind_dp->S[i]);
+        fgets(bind_var, sizeof bind_var, stdin);
+
+        n = strlen(bind_var) - 1;
+
+        bind_dp->L[i] = n;
+
+        bind_dp->V[i] = (char *) realloc(bind_dp->V[i],
+                         (bind_dp->L[i] + 1));            
+
+        strncpy(bind_dp->V[i], bind_var, n);
+
+        if ((strncmp(bind_dp->V[i], "NULL", 4) == 0) || (strncmp(bind_dp->V[i], "null", 4) == 0))
+            *bind_dp->I[i] = -1;
+        else
+            *bind_dp->I[i] = 0;
+    
+        bind_dp->T[i] = 1;
+    }
+
+    return;
+}
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
+int oracle_connect()
+{
+   EXEC SQL CONNECT :username IN SYSDBA MODE;
+   int Rc=sqlca.sqlcode;
+   switch(Rc)
+   {
+      case    0:
+                 return(TRUE);
+                 break;
+      case -1012:
+      case -1014:
+      case -1033:
+      case -1034:
+      case -1035:
+      case -1089:
+      case -1090:
+      case -1092:
+                 Env.logIt( INFO, "(warning)\n");
+                 EXEC SQL ROLLBACK RELEASE;
+                 fflush(NULL);
+                 exit(2);
+                 break;
+      default  :
+                 Env.logIt( INFO, "(ERROR)\n");
+                 Env.logIt( ERROR,sqlca.sqlerrm.sqlerrmc);
+                 EXEC SQL ROLLBACK RELEASE;
+                 exit(1);
+
+   } // END SWITCH
+}
+
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
+void sql_error(const int action, char inMsg[])
+{
+   char ErrorCode[64], tempStr[16];
+
+    sqlRc=sqlca.sqlcode;
+
+    Env.logIt( ERROR, "\t\t"); 
+    Env.logIt( ERROR, inMsg);
+    Env.logIt( ERROR, "queue offset : "); 
+    sprintf(tempStr,"%ld", dmlOffset);
+    Env.logIt( INFO_CR, tempStr);                                              // report the offset
+
+    Env.logIt( ERROR, "\t\t"); 
+    Env.logIt( INFO_CR, sqlca.sqlerrm.sqlerrmc);
+    Env.logIt( ERROR, "\t\t Statement: "); 
+    Env.logIt( INFO_CR, dyn_statement);
+
+    if (parse_flag)
+    {
+      Env.logIt( ERROR, "\t\tERROR : parsing SQL statement.\n\t\tCODE : ");
+      sprintf(ErrorCode,"%d", sqlca.sqlerrd[4]);
+      Env.logIt( INFO_CR, ErrorCode);
+    }
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+    if(action == EXIT) 
+    {
+       EXEC SQL ROLLBACK WORK;
+       exit(1);
+    }
+      
+    longjmp(jmp_continue, 1);
+}
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
+int resolveConflict(std::string schemaOwner, const char timeNow[])
+{
+  char strErrorCode[8]="";
+  char timeBuffer[TIME_BUF_LN];
+  int Rc=0;
+
+   switch(fmt.getTableName(dyn_statement)) 
+   {
+     case INSERT:
+                  Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+                  Env.logIt(INFO, "CONFLICT RESOLUTION\n");
+                  Env.logIt(INFO_PAD, "\t\tAnalyzing insert statement ");
+
+                  if ( fmt.insert2update() != TRUE)
+                  {
+                     Env.logIt(ERROR, "(ERROR)\n\t\t");
+                     Env.logIt(ERROR, fmt.errorMessage());
+                     return(FALSE); 
+                  }
+                  Env.logIt(INFO, "(ok)\n"); 
+
+                  Env.logIt(INFO_PAD, "\t\tLooking for record via primary key ");
+                  Rc=getDBTimeStamp(fmt.tableNameString(), fmt.predicateString(), fmt.timeStampString(), schemaOwner.c_str() );
+                  switch(Rc)
+                  {
+                    case  0:
+                             Env.logIt(INFO,  "(found)\n\t\tSQL in file is less than RDBMS time\n");
+                             return(FALSE);
+                             break;
+                    case  1:        
+                             Env.logIt(INFO,  "(found)\n\\ttSQL in file is greater than RDBMS time\n");
+                             strcpy(dyn_statement, fmt.sqlString());
+                             return(TRUE);
+                             break;
+                    default  :
+                             sprintf(strErrorCode,"%d", Rc);
+                             Env.logIt(INFO_PAD, "(ERROR)\nUnexpected error in call to GetDBTimestamp ");
+                             Env.logIt(INFO, "(");
+                             Env.logIt(INFO, strErrorCode);
+                             Env.logIt(INFO, ")\n");
+                             return(FALSE);
+                             break;
+                  }
+     case UPDATE:
+                  Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+                  Env.logIt(INFO, "CONFLICT RESOLUTION\n");
+                  Env.logIt(INFO_PAD, "\t\tAnalyzing update statement ");
+
+                  if ( fmt.update2insert() != TRUE)
+                  {
+                     Env.logIt(ERROR, "(ERROR)\n\t\t");
+                     Env.logIt(INFO_CR, fmt.errorMessage());
+                     return(FALSE);
+                  }
+                  Env.logIt(INFO_CR, "(ok)");
+
+                  Env.logIt(INFO_PAD, "\t\tLooking for record via primary key ");
+                  Rc=getDBTimeStamp(fmt.tableNameString(), fmt.predicateString(), fmt.timeStampString(), schemaOwner.c_str() );
+                  switch(Rc)
+                  {
+                    case  0:
+                             Env.logIt(INFO, "(found)\n\t\tSQL in file is less than RDBMS time\n");
+                             return(FALSE);
+                             break;
+                    case  1:        
+                             Env.logIt(INFO, "(found)\n\t\tSQL in file is greater than RDBMS time\n");
+                             fmt.update2update();
+                             strcpy(dyn_statement, fmt.sqlString());
+                             return(TRUE);
+                             break;
+                    case 1403:
+                             Env.logIt(INFO, "(warning)\nNo record found in DBMS, issuing insert\n");
+                             fmt.update2insert();
+                             strcpy(dyn_statement, fmt.sqlString());
+                             break;
+                    default  :
+                             sprintf(strErrorCode,"%d", Rc);
+                             Env.logIt(INFO_PAD, "(ERROR)\nUnexpected error in call to GetDBTimestamp ");
+                             Env.logIt(INFO,     "(");
+                             Env.logIt(INFO,     strErrorCode);
+                             Env.logIt(INFO,     ")\n");
+                             return(FALSE);
+                             break;
+                  }
+                  break;
+     case DELETE:
+                  Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+                  Env.logIt(INFO, "CONFLICT RESOLUTION\n");
+                  Env.logIt(INFO_PAD, "\t\tAnalyzing delete statement ");
+
+                  if ( fmt.delete2delete() != TRUE)
+                  {
+                     Env.logIt(ERROR, "(ERROR)\n\t\t");
+                     Env.logIt(ERROR, fmt.errorMessage());
+                     return(FALSE);
+                  }
+                  Env.logIt(INFO, "(ok)\n\t\t");
+                  Env.logIt(INFO_CR, fmt.sqlString());
+                  
+                  Env.logIt(INFO_PAD, "\t\tLooking for record via primary key ");
+                  Rc=getDBTimeStamp(fmt.tableNameString(), fmt.predicateString(), fmt.timeStampString(), schemaOwner.c_str() );
+                  switch(Rc)
+                  {
+                    case  0:
+                             Env.logIt(INFO, "(found)\nSQL in file is less than RDBMS time\n");
+                             return(FALSE);
+                             break;
+                    case  1:        
+                             Env.logIt(INFO, "(found)\nSQL in file is greater than RDBMS time\n");
+                             strcpy(dyn_statement, fmt.sqlString());
+                             break;
+                    case 1403:
+                             Env.logIt(INFO, "(warning)\nNo record found in DBMS, Ignoring delete\n");
+                             break;
+                    default  :
+                             sprintf(strErrorCode,"%d", Rc);
+                             Env.logIt(INFO_PAD, "(ERROR)\nUnexpected error in call to GetDBTimestamp ");
+                             Env.logIt(INFO,     "(");
+                             Env.logIt(INFO,     strErrorCode);
+                             Env.logIt(INFO,     ")\n");
+                             return(FALSE);
+                             break;
+                  }
+                  break;
+     default    :
+                  Env.logIt(TIME, Env.timeNow(timeBuffer, TIME_BUF_LN));
+                  Env.logIt(INFO, "CONFLICT RESOLUTION\n\t\t");
+                  Env.logIt(INFO_PAD, "WARNING - COULD NOT DETERMINE TABLE NAME.\n ");
+                  return(FALSE);
+   }
+
+   return(TRUE);
+}
+
+//---------------------------------------------------------------------------------------------------
+// returns: 0   - timestamp in the database is newer than the SQL string
+//          1   - Our timestamp from the SQL is newer than what's in the database
+//        1403  - No data found in the database
+//         -1   - Error (set global error code)
+//---------------------------------------------------------------------------------------------------
+int getDBTimeStamp(char inTableName[], char inPredicate[], char inTimeStamp[], const char schemaOwner[])
+{
+  int FetchedFlag=FALSE;
+  globalRC=0;
+  std::string stmtStr;
+
+  stmtStr = std::string("SELECT to_number(substr(to_timestamp(nvl(update_time,'2000-00-01 00:00:00.0000'),") +
+                        "'YYYY-DD-MM HH24:MI:SS.FF6') - "                                                    +
+                        "to_timestamp( " + inTimeStamp + ",'YYYY-DD-MM HH24:MI:SS.FF6'),1,1)||1)"            +
+                        " FROM " + schemaOwner + "." + inTableName + " "                                     +
+                        inPredicate;
+
+  strcpy((char *)hv_dynstmt2, stmtStr.c_str());
+
+  EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+  EXEC SQL PREPARE S FROM :hv_dynstmt2;
+
+  if(sqlca.sqlcode != 0)
+  {
+      return(sqlca.sqlcode);
+  }
+
+  EXEC SQL DECLARE C1 CURSOR FOR S;
+
+  EXEC SQL OPEN C1;
+
+  EXEC SQL WHENEVER NOT FOUND DO break;
+  for (;;)
+  {
+      EXEC SQL FETCH C1 INTO :timestamptest;
+      FetchedFlag=TRUE;
+      if(sqlca.sqlcode != 0)
+      {
+        return(sqlca.sqlcode);
+      }
+  }
+  EXEC SQL CLOSE C1;
+  if(FetchedFlag == FALSE) return(1403);    // If we break, we don't hit the sqlca code in the above loop
+  if(timestamptest < 0) return(1);          // change the value is this database
+  else                  return(0);          // don't do anything
+}
+//=============================================================================
+// Routine: switchQueue
+// purpose: when we receive the signal, and we are idle, the come here and
+//          switch to the next queue. We used to terminate, wait until the queue cleared
+//          but this is a better approach as we can continue to process
+//
+//=============================================================================
+int switchQueue(int numberOfQueues, char queueDir[])
+{
+   int queueNumber=(lg_stat.queueNumber + 1) % numberOfQueues;
+   if ( queueNumber == 0)
+   {
+      queueNumber=numberOfQueues;                           //  ie. if the previous was 2 (out of 3), now its 0
+   }                                                        //  so we set it to the max number of logs supported
+   lg_stat.queueNumber=queueNumber;
+
+   char tempString[MAX_TMP_LN];
+   memset(tempString, '\0', MAX_TMP_LN);
+   sprintf(tempString,"%05d", queueNumber);
+ 
+   std::string queueFile = std::string(queueDir) + "/queue" + tempString;
+
+   glb_queuefile.close();
+   glb_queuefile.open(queueFile.c_str(), std::ios::in);
+
+   return(queueNumber);
+}
+
+
+//=============================================================================
+// Routine: Wakeup
+// Purpose: When we gets a signal 17 (SIGUSER2), this means we want to cleanup
+//          Instead of doing a hard stop, we'll set a flag, hit the sleep routine
+//          and switch to a different log file
+//=============================================================================
+void Wakeup(int)
+{
+   char  timeBuffer[TIME_BUF_LN];
+
+   Env.logIt(TIME,  Env.timeNow(timeBuffer, TIME_BUF_LN));
+   Env.logIt (INFO_CR,"Wakeup:\t\tsignal 17");
+  
+   glb_switchState=TRUE;
+}
+
+//=============================================================================
+// Routine: Cleanup
+// Purpose: When we receive a signal to terminate, we come here and exit
+//          semi-gracefully
+//=============================================================================
+void Cleanup(int)
+{
+
+   char tempStr[12];
+   memset(tempStr,'\0', sizeof(tempStr));
+   sprintf(tempStr, "%ld", lg_stat.fileOffSet);
+
+   char  timeBuffer[TIME_BUF_LN];
+   memset(timeBuffer,'\0', sizeof(timeBuffer));
+   Env.logIt(TIME,  Env.timeNow(timeBuffer, TIME_BUF_LN));
+
+   Env.logIt (INFO, "\t\tLast Offset:\t");
+   Env.logIt (INFO_CR, tempStr); 
+   Env.logIt (INFO_CR, "\t\tTerminating:\tsignal 16");
+
+   exit(0);
+}
